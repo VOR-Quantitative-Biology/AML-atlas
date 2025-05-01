@@ -1,0 +1,4191 @@
+---
+title: "Transcriptomic analysis of cell states across timepoints"
+output: html_document
+date: "2024-09-11"
+---
+
+```{r setup, include = FALSE}
+
+library(devtools)
+library(flowCore)
+library(SeuratObject)
+library(BPCells)
+library(Seurat)
+library(SeuratDisk)
+library(dplyr)
+library(aws.s3)
+library(tibble)
+library(tidyr)
+library(dotenv)
+library(ggplot2)
+library(ggpubr)
+library(glue)
+library(DoubletFinder)
+library(tidyseurat)
+library(pzfx)
+library(preprocessCore)
+library(pals)
+library(EnhancedVolcano)
+library(SeuratWrappers)
+library(alphahull)
+library(igraph)
+library(reticulate)
+library(viridis)
+library(msigdbr)
+library(GSVA)
+library(escape)
+library(dittoSeq)
+library(fgsea)
+library(GSEABase)
+library(ggbeeswarm)
+library(circlize)
+library(pheatmap)
+library(biomaRt)
+library(SingleCellExperiment)
+library(Matrix)
+library(stringr)
+library(ComplexHeatmap)
+library(future)
+library(circlize)
+library(msigdbr)
+library(survival)
+library(survminer)
+library(broom)
+library(scales)
+library(lubridate)
+library(future)
+library(ggsci)
+library(bazar)
+library(flowCore)
+library(mclust)
+library(doParallel)
+library(foreach)
+library(scales)
+library(tictoc)
+library(randomForest)
+library(e1071)
+library(survminer)
+library(robCompositions)
+library(limma)
+library(infercnv)
+library(vcfR)
+library(edgeR)
+library(patchwork)
+
+options(Seurat.object.assay.version = "v3")
+options(future.globals.maxSize = 1e9)
+
+load_dot_env(file = "/home/rstudio/data/bitbucket/.env")
+
+knitr::opts_knit$set(root.dir = "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas")
+
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = Sys.getenv("key"),
+  "AWS_SECRET_ACCESS_KEY" = Sys.getenv("secret"),
+  "AWS_DEFAULT_REGION" = "us-east-1"
+)
+
+cl <- makeCluster(12)
+registerDoParallel(cl)
+
+```
+
+# Load data
+```{r load_data}
+
+aml_data <- aws.s3::s3readRDS(object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/seurat_v5/seurat_2024-04-03/aml_data_v4.rds")
+
+patient_order <- c("P26", "P44", "P52", "P70", "P61", "P31", "P43", "P30", "P64", "P56", "P54", "P27", "P41", "P49", "P51", "P50", "P66", "P29", "P67", "P42", "P65", "P60", "P58", "P28", "P40", "P4") 
+patient_id_map <- data.frame(patient = patient_order, 
+                             patient_manuscript_id = paste0("P", 1:length(patient_order))) %>%
+  dplyr::mutate(patient = factor(patient, levels = patient_order),
+                patient_manuscript_id = ifelse(nchar(patient_manuscript_id) == 2, gsub("P", "P0", patient_manuscript_id), patient_manuscript_id),
+                patient_manuscript_id = factor(patient_manuscript_id, levels = patient_manuscript_id))
+
+#healthy_data <- readRDS("/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat_2024-04-03/healthy_data_v2.rds")
+healthy_data <- aws.s3::s3readRDS(object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/seurat_v5/seurat_2024-04-03/healthy_data_v4.rds")
+
+blast_object <- dplyr::filter(aml_data, 
+                              cell_state_harmony_rna %in% "Blast",
+                              !cell_state_harmony_rna %in% "Unknown") %>%
+  dplyr::mutate(cell_state_harmony_rna = droplevels(cell_state_harmony_rna))
+
+lsc17 <- list(lsc17 = c("AKR1C3",
+                        "ARHGAP22",
+                        "TMEM259", # (C19orf177)
+                        "CD34",
+                        "CDK6",
+                        "CPXM1",
+                        "DNMT3B",
+                        "DPYSL3",
+                        "EMP1",
+                        "ADGRG1",
+                        "FAM30A",
+                        "LAPTM4B",
+                        "MMRN1",
+                        "BEX3",
+                        "NYNRIN",
+                        "SOCS2",
+                        "ZBTB46"))
+
+
+blast_object <- AddModuleScore(blast_object, 
+                               features = lsc17,
+                               assay = "RNA",
+                               name = "lsc17") %>%
+  dplyr::rename(lsc17 = lsc171)
+
+lscs <- blast_object$barcode[blast_object@assays$ADT@data["CD34", ] > 1 & blast_object@assays$ADT@data["CD38", ] < 1 & blast_object$lsc17 > 0]
+lsc_object <- dplyr::filter(blast_object, barcode %in% lscs)
+
+blast_object <- blast_object %>%
+  dplyr::mutate(lsc = ifelse(barcode %in% lsc_object$barcode, "LSC", "blast"))
+
+mycols <- c("firebrick1", "lightcyan3", "seagreen3", "cyan", "purple", "hotpink", "gold1", "mediumturquoise", "yellow2", "sienna3", "springgreen", "olivedrab", "orange1",  "cornflowerblue", "rosybrown1", "maroon2", "slateblue2", "tan2", "peachpuff1", "orchid1", "yellowgreen", "burlywood2")
+
+```
+
+# Plot blast percentages from flow
+```{r blast_percentages_flow}
+
+df <- aml_data@meta.data %>%
+  dplyr::select(patient_manuscript_id, time, blast_percent_vor) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(percent_remaining = 100 - blast_percent_vor) %>%
+  tidyr::pivot_longer(-c(patient_manuscript_id, time), values_to = "value", names_to = "portion")
+
+# Create the pie charts with percentage labels (only on the "percent" slice)
+ggplot(df, aes(x = "", y = value, fill = portion)) +
+  geom_bar(stat = "identity", width = 1, color = "black") +
+  coord_polar("y", clip = "off") +
+  facet_grid(time ~ patient_manuscript_id) +   # Arrange all charts in one row
+  theme_void() +                  # Removes axes, gridlines, and background
+  scale_fill_manual(values = c("bisque1", "white"))
+
+```
+
+# Visualize important features
+```{r featureplots}
+
+DefaultAssay(aml_data) <- "ADT"
+aml_data <- ScaleData(aml_data, assay = "ADT", features = rownames(aml_data@assays$ADT))
+aml_data <- ScaleData(aml_data, assay = "RNA", features = rownames(aml_data@assays$RNA))
+FeaturePlot(aml_data, features = c("CD45"), reduction = "umap_harmony", slot = 'scale.data', keep.scale = "all", order = TRUE) + 
+  NoAxes() +
+  scale_color_gradientn( colours = c('bisque', 'cornflowerblue', 'yellow'),  limits = c(-2, 2))
+
+DefaultAssay(aml_data) <- "RNA"
+FeaturePlot(aml_data, features = c("PTPRC"), reduction = "umap_harmony", slot = 'scale.data', keep.scale = "all", order = TRUE) + 
+  NoAxes() +
+  scale_color_gradientn( colours = c('bisque', 'cornflowerblue', 'yellow'),  limits = c(-2, 2))
+
+DoHeatmap(blast_object, group.by = "cell_state_harmony_rna", assay = "RNA", features = c("GMSCF", "FLT3L", "TNF", "TGFB", "CTLA4", "PDL1", "PD1"))
+VlnPlot(blast_object, group.by = "cell_state_harmony_rna", assay = "RNA", features = c("GMSCF", "FLT3L", "TNF", "TGFB", "CTLA4", "CD274", "PDCD1"), pt.size = 0)
+
+```
+
+# Visualize cell state composition
+## Blasts
+```{r cell_state_composition, fig.width = 12, fig.height = 5}
+
+cell_states <- c("HSC",
+                 "GMP",
+                 "MEP",
+                 "Monocyte",
+                 "cDC",
+                 "pDC",
+                 "NK",
+                 "NKT",
+                 "B cell",
+                 "Pre/pro B cell",
+                 "CD4+ naive T",
+                 "CD4+ memory T",
+                 "CD8+ naive T",
+                 "CD8+ memory T",
+                 "Erythroblast",
+                 "Erythroid",
+                 "MkP",
+                 "Unknown")
+
+cluster_summary <- blast_object@meta.data
+
+cluster_summary <- cluster_summary %>%
+  dplyr::filter(!predicted_id %in% "Unknown") %>%
+  dplyr::group_by(time, predicted_id, patient) %>%
+  dplyr::summarise(count = n(), 
+                   response_to_initial_tx = unique(response_to_initial_tx),
+                   date_of_dx = unique(date_of_dx),
+                   relapse_date_1 = unique(relapse_date_1),
+                   relapse_date_2 = unique(relapse_date_2),
+                   vital_status = unique(vital_status),
+                   date_of_death_or_last_follow_up = unique(date_of_death_or_last_follow_up),
+                   blast_percent_vor = unique(blast_percent_vor),
+                   lsc_percentage = unique(lsc_percentage),
+                   fab_classification = unique(fab_classification),
+                   cytogenetics_1 = unique(cytogenetics_1)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(patient, time) %>%
+  dplyr::mutate(pct = (round((count / sum(count)), 3)) * 100,
+                time = factor(as.character(ifelse(time == "Diagnosis", "Dx", "Re")), levels = c("Dx", "Re")),
+                patient = gsub("Patient_", "P", patient),
+                predicted_id = factor(predicted_id, levels = cell_states)) %>%
+  dplyr::ungroup() %>%
+  dplyr::rename(`Blast cell state` = predicted_id) %>%
+  dplyr::mutate(relapse_status = "Relapsed",
+                time_dx_to_re = relapse_date_1 - date_of_dx,
+                time_re_to_last_follow_up = date_of_death_or_last_follow_up - relapse_date_1,
+                time_dx_to_last_follow_up = date_of_death_or_last_follow_up - date_of_dx,
+                sex = ifelse(grepl("XX", cytogenetics_1), "female", "male"))
+
+hsc_rank <- dplyr::filter(cluster_summary, `Blast cell state` == "HSC", time == "Dx") %>%
+  dplyr::arrange(desc(pct)) %>%
+  dplyr::pull(patient)
+
+hsc_rank <- c(hsc_rank, unique(cluster_summary$patient[!cluster_summary$patient %in% hsc_rank]))
+
+cluster_summary <- cluster_summary %>%
+  dplyr::mutate(patient = factor(patient, levels = hsc_rank),
+                broad_cell_state = dplyr::case_when(`Blast cell state` %in% c("NK", "NKT", "B cell", "CD4+ T", "CD4+ memory T", "CD8+ T", "CD8+ memory T", "CD4+ naive T", "CD8+ naive T") ~ "Lymphoid", 
+                                                    TRUE ~ as.character(`Blast cell state`)),
+                broad_cell_state = factor(broad_cell_state, levels = c("HSC", "GMP", "MEP", "Monocyte", "cDC", "pDC", "MkP", "Pre/pro B cell", "Erythroblast", "Erythroid", "Lymphoid"))) %>%
+  dplyr::filter(!broad_cell_state %in% c("Erythroid", "Lymphoid"))
+levels(cluster_summary$broad_cell_state) <- paste0(levels(cluster_summary$broad_cell_state), "-like")
+
+mycols <- c("firebrick1", "seagreen3", "lightcyan3", "cyan", "purple", "hotpink", "slateblue2", "yellow2", "rosybrown1", "maroon2", "cornflowerblue")
+other_colors <- c("gold1", "mediumturquoise",  "sienna3", "springgreen", "olivedrab", "orange1",  "cornflowerblue", "maroon2", "tan2", "peachpuff1", "orchid1", "yellowgreen", "burlywood2")
+
+cluster_summary <- dplyr::mutate(cluster_summary, patient = factor(patient, levels = patient_order)) %>%
+  dplyr::left_join(patient_id_map, by = "patient")
+
+
+ggplot(dplyr::mutate(cluster_summary, time = ifelse(time == "Dx", "D", "R")) %>%
+         dplyr::rename(`Blast lineage` = `broad_cell_state`), 
+       aes(x = time, y = count, fill = `Blast lineage`)) + 
+  geom_bar(position = "fill", stat = "identity", width = 0.7) + 
+  xlab("") +
+  ylab("Fraction of blasts") +
+  facet_grid(~patient_manuscript_id) +
+  scale_fill_manual(values = mycols) +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 14)) 
+
+
+jfeat <- c("CD274", "GMSCF", "FLT3", "TNF", "CTLA4")
+boo <- rownames(aml_data@assays$RNA)
+boo <- boo[grepl("^EGF|^FGF|^TGF", boo)]
+jfeat <- c(jfeat, boo)
+
+
+DoHeatmap(subset(aml_data, cells = sample(colnames(aml_data, 300))), features = jfeat, group.by = "cell_state_harmony_rna")
+
+```
+
+## Monocytes
+```{r monocytes_m1m2_composition}
+
+monocytes <- dplyr::filter(aml_data, cell_state_harmony_rna %in% "Monocyte")
+DefaultAssay(monocytes) <- "RNA"
+monocytes@assays$RNA@layers$data <- NULL
+monocytes@assays$RNA@layers$scale.data <- NULL
+# feats_include <- rownames(monocytes@assays$RNA)[rowSums(monocytes@assays$RNA@layers$counts) > 1]
+# feats_include <- c(feats_include, rownames(monocytes@assays$ADT))
+# monocytes <- subset(monocytes, features = feats_include)
+
+monocytes[["RNA"]] <- split(monocytes[["RNA"]], f = monocytes$sample_id)
+monocytes <- FindVariableFeatures(monocytes, selection.method = "dispersion")
+monocytes <- NormalizeData(monocytes)
+monocytes <- ScaleData(monocytes)
+monocytes <- RunPCA(monocytes)
+Idents(monocytes) <- "sample_id"
+monocytes <- IntegrateLayers(object = monocytes, assay = "RNA", method = FastMNNIntegration)
+monocytes <- FindNeighbors(monocytes, reduction = "integrated.mnn")
+monocytes <- FindClusters(monocytes, random.seed = 159828)
+monocytes <- RunUMAP(monocytes, reduction = "integrated.mnn", dims = 1:50, seed.use = 1195)
+
+DefaultAssay(monocytes) <- "RNA"
+VlnPlot(monocytes, 
+        group.by = "seurat_clusters", 
+        features = c("CD33", "IL4", "IL6", "CD86", "MRC1", "CD163", "CD80", "IL6", "IL10", "CD274"), 
+        pt.size = 0,
+        layer = "data")  
+
+
+Idents(monocytes) <- "seurat_clusters"
+tmp_object <- CreateSeuratObject(counts = as(LayerData(JoinLayers(monocytes), assays = "RNA", layer = "counts"), "dgCMatrix"),
+                                 meta.data = monocytes@meta.data)
+Idents(tmp_object) <- "seurat_clusters"
+mono_markers <- FindAllMarkers(tmp_object, latent.vars = "sample_id", test.use = "MAST", only.pos = TRUE, assay = "RNA")
+
+
+
+
+monocytes <- dplyr::mutate(monocytes, m2 = ifelse(seurat_clusters %in% 3, "M2", "other"))
+monocytes_re <- dplyr::filter(monocytes, time %in% "Relapse")
+monocytes_dx <- dplyr::filter(monocytes, time %in% "Diagnosis")
+
+re_tab <- table(monocytes_re$m2, monocytes_re$response_to_initial_tx)
+re_tab <- sweep(re_tab, MARGIN = 2, STATS = colSums(re_tab), FUN = "/")
+
+dx_tab <- table(monocytes_dx$m2, monocytes_dx$response_to_initial_tx)
+dx_tab <- sweep(dx_tab, MARGIN = 2, STATS = colSums(dx_tab), FUN = "/")
+
+
+mac_gs <- immune_gs_list[grepl("GSE5099_CLASSICAL_M1_VS_ALTERNATIVE_M2_MACROPHAGE", names(immune_gs_list))]
+
+m1_genes_nc <- c("S100A8", "S100A9", "S100A12", "TYROBP", "VCAN", 
+                "CD68", "MNDA", "CYBB", "STAT1", "FOS", "TREM1", 
+                "CD44", "NFKB2", "IL1B", "CD60", "CD80", "CD86", "IFNG")
+
+mac_gs <- c(mac_gs, m1_nc = list(m1_genes_nc))
+names(mac_gs) <- c("M2", "M1", "M1_NC")
+mac_gs <- mac_gs[c(2, 3, 1)]
+monocytes <- AddModuleScore(object = JoinLayers(monocytes), 
+                            features = mac_gs, 
+                            name = "M", search = TRUE, assay = "RNA") %>%
+  dplyr::rename(M1_NC = M2, M2 = M3)
+
+monocytes <- monocytes %>%
+  dplyr::mutate(M1_cat = ifelse(M1_NC > median(M1_NC), "M1", "M2"),
+                M2_cat = ifelse(M2 > median(M2), "M2", "M1")) %>%
+  dplyr::mutate(M_consensus = ifelse(M1_cat == M2_cat, M1_cat, NA))
+
+bardata <- table(monocytes$M_consensus, monocytes$sample_id) %>% 
+  t() %>% 
+  as.data.frame() %>%
+  dplyr::rename(sample_id = Var1, macrophage = Var2, freq = Freq) %>%
+  dplyr::mutate(freq = freq + 1) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::mutate(M1_M2_ratio = log2(freq[macrophage == "M1"] / freq[macrophage == "M2"])) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(M1_M2_ratio) %>%
+  dplyr::mutate(time = ifelse(grepl("Diagnosis", sample_id), "D", "R"),
+                patient = gsub("_relapse|_Relapse", "", sample_id),
+                patient = gsub("Patient_", "P", patient),
+                patient = factor(patient, levels = levels(cluster_summary$patient)))
+
+ggbarplot(data = bardata,
+          x = "time",
+          y = "freq",
+          fill = "macrophage",
+          palette = "npg") +
+  facet_grid(~patient) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+bardata_ratio <- dplyr::select(bardata, patient, time, M1_M2_ratio) %>% 
+  distinct() %>%
+  dplyr::arrange(desc(M1_M2_ratio)) 
+
+tmp_order <- dplyr::filter(bardata_ratio, time == "D") %>%
+  dplyr::arrange(desc(M1_M2_ratio)) %>%
+  dplyr::pull(patient)
+
+bardata_ratio <- dplyr::mutate(bardata_ratio, patient = factor(patient, levels = tmp_order))
+# pat_surv <- dplyr::arrange(mutation_data, time_dx_to_last_follow_up) %>% dplyr::pull(patient)
+# pat_surv <- gsub("Patient_", "P", pat_surv)
+# 
+# bardata_ratio <- dplyr::slice(bardata_ratio, match(pat_surv, patient))
+
+ggbarplot(data = bardata_ratio,
+          x = "patient",
+          y = "M1_M2_ratio",
+          fill = "time",
+          position = position_dodge(),
+          palette = "npg")
+
+
+
+```
+
+## CD34+CD38- LSCs
+```{r cell_state_composition_lscs, fig.width = 12, fig.height = 5}
+
+cell_states <- c("HSC",
+                  "MEP",
+                  "GMP",
+                  "Monocyte",
+                  "DC",
+                  "NK",
+                  "B cell",
+                  "preB",
+                  "CD4+ naive T",
+                  "CD4+ memory T",
+                  "CD8+ naive T",
+                  "CD8+ memory T",
+                  "Erythroblast",
+                  "Erythroid",
+                  "Unknown")
+
+cluster_summary <- lsc_object@meta.data
+cluster_summary <- cluster_summary %>%
+  dplyr::filter(!predicted_id %in% "Unknown") %>%
+  dplyr::group_by(time, predicted_id, patient) %>%
+  dplyr::summarise(count = n(), 
+                   response_to_initial_tx = unique(response_to_initial_tx),
+                   date_of_dx = unique(date_of_dx),
+                   relapse_date_1 = unique(relapse_date_1),
+                   relapse_date_2 = unique(relapse_date_2),
+                   vital_status = unique(vital_status),
+                   date_of_death_or_last_follow_up = unique(date_of_death_or_last_follow_up),
+                   blast_percent_vor = unique(blast_percent_vor),
+                   lsc_percentage = unique(lsc_percentage),
+                   fab_classification = unique(fab_classification),
+                   cytogenetics_1 = unique(cytogenetics_1)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(patient, time) %>%
+  dplyr::mutate(pct = (round((count / sum(count)), 3)) * 100,
+                time = factor(as.character(ifelse(time == "Diagnosis", "Dx", "Re")), levels = c("Dx", "Re")),
+                patient = gsub("Patient_", "P", patient),
+                predicted_id = factor(predicted_id, 
+                                      levels = cell_states)) %>%
+  dplyr::ungroup() %>%
+  dplyr::rename(`Blast cell state` = predicted_id) %>%
+  dplyr::mutate(relapse_status = "Relapsed",
+                time_dx_to_re = relapse_date_1 - date_of_dx,
+                time_re_to_last_follow_up = date_of_death_or_last_follow_up - relapse_date_1,
+                time_dx_to_last_follow_up = date_of_death_or_last_follow_up - date_of_dx,
+                sex = ifelse(grepl("XX", cytogenetics_1), "female", "male"))
+
+hsc_rank <- dplyr::filter(cluster_summary, `Blast cell state` == "HSC", time == "Dx") %>%
+  dplyr::arrange(desc(pct)) %>%
+  dplyr::pull(patient)
+
+hsc_rank <- c(hsc_rank, unique(cluster_summary$patient[!cluster_summary$patient %in% hsc_rank]))
+
+cluster_summary <- cluster_summary %>%
+  dplyr::mutate(patient = factor(patient, levels = hsc_rank),
+                broad_cell_state = ifelse(`Blast cell state` %in% c("NK", "Naive B", "preB", "memory B", "Plasma", "CD4+ T", "CD4+ memory T", "CD8+ T", "CD8+ memory T"), "Lymphocyte", as.character(`Blast cell state`)))
+
+ggplot(dplyr::mutate(cluster_summary, time = ifelse(time == "Dx", "D", "R")) %>%
+         dplyr::rename(`Blast lineage` = `Blast cell state`), 
+       aes(x = time, y = count, fill = `Blast lineage`)) + 
+  geom_bar(position = "fill", stat = "identity", width = 0.7) + 
+  xlab("") +
+  ylab("Fraction of blasts") +
+  facet_grid(~patient) +
+  scale_fill_manual(values = mycols) +
+  theme_light() +
+  theme(axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 14)) 
+
+```
+
+## Healthy
+```{r healthy_data}
+
+healthy_data_filt <- healthy_data %>%
+  dplyr::mutate(broad_cell_state = dplyr::case_when(cell_state_mnn_rna_l1 %in% c("NK", "NKT", "B cell", "CD4+ T", "CD4+ memory T", "CD8+ T", "CD8+ memory T", "CD4+ naive T", "CD8+ naive T") ~ "Lymphoid", 
+                                                    TRUE ~ as.character(cell_state_mnn_rna_l1)),
+                broad_cell_state = factor(broad_cell_state, levels = c("HSC", "GMP", "MEP", "Monocyte", "cDC", "pDC", "preMegakaryocyte", "preB", "Erythroblast", "Erythroid", "Lymphoid"))) %>%
+  dplyr::filter(grepl("JD", patient))
+
+healthy_summary <- table(healthy_data_filt$patient, healthy_data_filt$broad_cell_state) %>%
+  as.data.frame() %>%
+  dplyr::rename(patient = Var1, `Lineage` = Var2, count = Freq) %>%
+  dplyr::mutate(sample_treatment = ifelse(grepl("JD", patient), "Frozen", "Fresh RBC-lysed")) %>%
+  dplyr::filter(sample_treatment %in% "Frozen",
+                !Lineage %in% c("Unknown", "Erythroid", "Lymphoid")) %>%
+  dplyr::group_by(patient) %>%
+  dplyr::mutate(fraction = count / sum(count),
+                patient = gsub("_Healthy", "", patient),
+                patient = gsub("Donor_", "H", patient),
+                time = "Healthy") %>%
+  dplyr::ungroup()
+
+
+ggplot(healthy_summary, aes(x = time, y = count, fill = `Lineage`)) + 
+  geom_bar(position = "fill", stat = "identity", width = 0.7) + 
+  xlab("") +
+  ylab("Fraction of cells") +
+  facet_grid(~time) +
+  scale_fill_manual(values = mycols) +
+  theme_light() +
+  theme(axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 14)) 
+
+```
+
+# Heatmaps of Ags
+## Ags across blast lineage states
+```{r blast_lineage_states_markers}
+
+DefaultAssay(blast_object) <- "ADT"
+Idents(blast_object) <- "predicted_id"
+
+mymarkers <- FindAllMarkers(blast_object, assay = "ADT")
+top_feats <- mymarkers$gene[abs(mymarkers$avg_log2FC) > 1.5]
+DoHeatmap(subset(blast_object, cells = sample(colnames(blast_object), 1000)),
+          group.by = "predicted_id",
+          features = top_feats,
+          assay = "ADT")
+
+```
+
+## Ag change
+```{r heatmap_of_ags, fig,width = 8, fig.height = 12}
+
+blast_object_split <- SplitObject(blast_object, split.by = "patient")
+
+markers_remove <- c("ISOTYPE-IGG1K", "ISOTYPE-RAT", "ISOTYPE-ARMENIAN-HAMSTER", "CD34", "CD4", "CD4B", "CD3", "CD8", "CD8A", "CD19", "CD14", "CD15", "CD16", "CD11C", "CD5", "CD34", "CD38", "CD45", "CD9")
+
+markers_remove <- ""
+marker_list <- lapply(blast_object_split, function(patient_object) {
+  
+  Idents(patient_object) <- "time"
+  
+  if (length(unique(patient_object$time)) == 2) {
+    
+    markers <- FindMarkers(patient_object, 
+                           ident.1 = "Relapse",
+                           ident.2 = "Diagnosis",
+                           max.cells.per.ident = min(table(patient_object$time)),
+                           assay = "ADT", 
+                           logfc.threshold = 0, 
+                           min.pct = 0, 
+                           return.thresh = 1) %>%
+      dplyr::arrange(desc(abs(avg_log2FC))) %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("gene")
+  
+    return(markers)
+  
+  } else {
+    
+    return(NA)
+    
+  }
+  
+})
+
+marker_list <- marker_list[!is.na(marker_list)]
+de_adt <- lapply(marker_list, function(arg) {
+  dplyr::filter(arg, abs(avg_log2FC) > 1, !grepl("ISOTYPE", gene)) %>% 
+  dplyr::pull(gene)
+})
+de_adt <- table(as.character(unlist(de_adt)))
+de_adt_patient <- names(de_adt)[de_adt == 1]
+de_adt_multi <- names(de_adt)[de_adt > 1]
+
+filt_adt <- rownames(blast_object@assays$ADT)
+filt_adt <- filt_adt[!filt_adt %in% markers_remove]
+filt_adt <- filt_adt[!grepl("ISOTYPE", filt_adt)]
+
+# pseudobulk <- AverageExpression(blast_object, assay = "ADT", slot = "data", group.by = c("patient", "time"))$ADT
+# pseudobulk <- pseudobulk[rownames(pseudobulk) %in% filt_adt, ]
+# pseudo_diag <- pseudobulk[, grepl("Diagnosis", colnames(pseudobulk))]
+# pseudo_re <- pseudobulk[, grepl("Relapse", colnames(pseudobulk))]
+# heatdata <- log1p(as.matrix(pseudo_re)) - log1p(as.matrix(pseudo_diag))
+# colnames(heatdata) <- gsub("_Relapse", "", colnames(heatdata))
+
+heatdata <- lapply(marker_list, function(arg) dplyr::arrange(arg) %>%
+                     dplyr::select(gene, avg_log2FC) %>%
+                     dplyr::filter(!grepl("ISOTYPE", gene)))
+
+heatdata <- lapply(names(heatdata), function(arg) {
+  colnames(heatdata[[arg]]) <- c("gene", arg)
+  return(heatdata[[arg]])
+})
+
+heatdata <- purrr::reduce(heatdata, .f = full_join) %>%
+  tibble::column_to_rownames("gene") %>%
+  as.matrix()
+heatdata[is.na(heatdata)] <- 0
+
+sample_category <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                        object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_atlas_sample_category.csv") %>%
+  distinct()
+
+clinical_metadata <- aws.s3::s3read_using(
+  FUN = readr::read_csv, 
+  object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_atlas_sample_metadata_2024-04-03.csv"
+) %>%
+  dplyr::left_join(sample_category, by = "uhn_patient_id") %>%
+  janitor::clean_names() %>%
+  dplyr::select(patient, 
+                date_of_dx, 
+                hsct, 
+                dx, 
+                initial_tx, 
+                response_to_initial_tx, 
+                date_of_death_or_last_follow_up, 
+                karyotype,
+                npm1_2,
+                flt3_itd_2,
+                flt3_tkd_2,
+                runx1_runx1t1,
+                #nup98_rearrangement,
+                cebpa,
+                other_mutations,
+                #kmt2_rearrangement,
+                mecom_rearrangement) %>%
+  dplyr::filter(!grepl("Donor", patient)) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(days_survival = as_date(date_of_death_or_last_follow_up) - as_date(date_of_dx),
+                hsct = ifelse(hsct %in% "HSCT", "Yes", NA),
+                response_to_initial_tx = gsub(" \\(.*|", "", response_to_initial_tx),
+                response_to_initial_tx = factor(response_to_initial_tx, 
+                                                levels = c("Complete response", "Partial response", "No response"))) %>%
+  dplyr::right_join(data.frame(patient = as.character(colnames(heatdata))))
+
+column_ha <- HeatmapAnnotation(
+  
+  "Days to last follow up" = anno_barplot(clinical_metadata$days_survival),
+  "HSC transplant" = clinical_metadata$hsct,
+  "Response to therapy" = clinical_metadata$response_to_initial_tx,
+  "Initial therapy" = clinical_metadata$initial_tx,
+  "Karyotype" = clinical_metadata$karyotype,
+  "MECOM rearrangement" = clinical_metadata$mecom_rearrangement,
+  "Other mutations" = clinical_metadata$other_mutations,
+  "NPM1" = clinical_metadata$npm1_2,
+  "FLT3-ITD" = clinical_metadata$flt3_itd_2,
+  "FLT3-TKD" = clinical_metadata$flt3_tkd_2,
+  "RUNX1-RUNX1T1" = clinical_metadata$runx1_runx1t1,
+  #"NUP98 Rearrangement"= clinical_metadata$nup98_rearrangement,
+  "CEBPA" = clinical_metadata$cebpa,
+  
+  col = list(`HSC transplant` = c("Yes" = "black"),
+             `Karyotype` = c("Abnormal" = "orange3", "Complex" = "cyan3", "Normal" = "yellowgreen"),
+             `Response to therapy` = c("Complete response" = "palegreen4", "Partial response" = "cornflowerblue", "No response" = "sienna"),
+             `NPM1` = c("Yes" = "black"),
+             `FLT3-ITD` = c("Yes" = "black"),
+             `FLT3-TKD` = c("Yes" = "black"),
+             `RUNX1-RUNX1T1` = c("Yes" = "black"),
+             `CEBPA` = c("Yes" = "black"),
+             `Other mutations` = c("Yes" = "black"),
+             `MECOM rearrangement` = c("Yes" = "black"))
+)
+
+col_split <- factor(ifelse(colnames(heatdata) %in% clinical_metadata$patient[clinical_metadata$response_to_initial_tx %in% c("No response")], "b", "a"))
+
+col_split <- dplyr::case_when(
+  colnames(heatdata) %in% "Patient_29" ~ "a",
+  colnames(heatdata) %in% clinical_metadata$patient[clinical_metadata$response_to_initial_tx %in% c("No response", "Partial response")] ~ "b",
+  TRUE ~ "c") %>%
+  as.factor()
+
+col_split <- factor(ifelse(colnames(heatdata) %in% clinical_metadata$patient[clinical_metadata$patient %in% c("Patient_29")], "b", "a"))
+
+tmp_order <- levels(cluster_summary$patient)
+tmp_order <- gsub("^P", "Patient_", tmp_order)
+tmp_order <- match(tmp_order, colnames(heatdata))
+
+set.seed(42312)
+ComplexHeatmap::Heatmap(
+  
+  heatdata, 
+  clustering_method_rows = "ward.D2", 
+  clustering_method_columns = "ward.D2",
+  cluster_columns = TRUE,
+  top_annotation = column_ha,
+  column_order = tmp_order,
+  column_names_rot = 90,
+  column_gap = unit(3, "mm"),
+  column_title = NULL,
+  #column_km = 2,
+  row_dend_side = "left"
+)
+
+```
+
+## Ag pseudobulk
+```{r ag_pseudobulk, fig.height = 4, fig.width = 13}
+
+blast_object@assays$ADT_dsb_qc_filter@counts <- blast_object@assays$ADT_dsb_qc_filter@data
+blast_object@assays$ADT_limma@counts <- blast_object@assays$ADT_limma@data
+
+myassay <- "ADT_dsb_qc_filter"
+sample_pb <- AverageExpression(blast_object,
+                               layer = "counts",
+                               assay = myassay,
+                               group.by = "sample_id",
+                               return.seurat = TRUE)
+
+# sample_pb <- AggregateExpression(blast_object,
+#                                  assays = myassay,
+#                                  group.by = "sample_id",
+#                                  return.seurat = TRUE)
+# 
+# sample_pb <- NormalizeData(sample_pb, assay = myassay, normalization.method = "CLR", margin = 2)
+
+sample_pb <- sample_pb %>% 
+  dplyr::mutate(patient = gsub("-Diagnosis|-Relapse", "", sample_id),
+                patient = gsub("Patient-", "P", patient),
+                patient = factor(patient, levels = levels(cluster_summary$patient)))
+
+
+DefaultAssay(sample_pb) <- myassay
+datamat <- LayerData(sample_pb, assay = myassay, layer = "counts")
+datamat <- limma::normalizeQuantiles(datamat)
+sample_pb[["ADT_qn"]] <- CreateAssayObject(data = datamat)
+adt_matrix <- LayerData(sample_pb, features = c("CD33", "CLL1", "EMR2", "CD123"), assay = "ADT_qn", layer = "data")
+
+tmp_order <- sample_pb@meta.data %>%
+  dplyr::arrange(patient) %>%
+  dplyr::pull(sample_id) %>%
+  rev()
+
+adt_matrix <- adt_matrix[, match(tmp_order, colnames(adt_matrix))] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("ag") %>%
+  dplyr::mutate(assay = "ADT")
+
+# ag density
+mypath <- "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/20250331_Antigen Density Matched Blasts Diagnosis vs  Relapse bone marrow.csv"
+flow_ag_data <- aws.s3::s3read_using(readr::read_csv, object = mypath)
+colnames(flow_ag_data) <- gsub(" ", "-", colnames(flow_ag_data))
+flow_ag_data <- flow_ag_data %>%
+  dplyr::mutate(patient = paste0("Patient-", patient)) %>%
+  tidyr::pivot_longer(-c(patient), names_to = "sample", values_to = "flow_antigen_density") %>%
+  tidyr::separate(sample, into = c("ag", "time"), sep = "-") %>%
+  tidyr::unite(sample_id, patient, time, sep = "-") %>%
+  dplyr::filter(sample_id %in% tmp_order) %>%
+  tidyr::pivot_wider(values_from = flow_antigen_density, names_from = sample_id) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("ag")
+
+flow_ag_data <- flow_ag_data %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("ag") %>%
+  dplyr::mutate(assay = "QuantiBRITE")
+
+# ag positivity
+mypath <- "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/20240425_Percent Positivity Matched Blasts Diagnosis vs  Relapse bone marrow .csv"
+flow_pos_data <- aws.s3::s3read_using(readr::read_csv, object = mypath)
+colnames(flow_pos_data) <- gsub(" ", "-", colnames(flow_pos_data))
+flow_pos_data <- flow_pos_data %>%
+  dplyr::mutate(patient = paste0("Patient-", patient)) %>%
+  tidyr::pivot_longer(-c(patient), names_to = "sample", values_to = "flow_antigen_density") %>%
+  tidyr::separate(sample, into = c("ag", "time"), sep = "-") %>%
+  tidyr::unite(sample_id, patient, time, sep = "-", remove = FALSE) %>%
+  dplyr::filter(sample_id %in% tmp_order)
+
+myorder <- flow_pos_data %>%
+  dplyr::filter(ag == "CD33", time == "Relapse") %>%
+  dplyr::arrange(desc(flow_antigen_density)) %>%
+  dplyr::pull(sample_id) %>%
+  str_replace("-Relapse", "")
+
+myorder <- unlist(lapply(myorder, function(arg) c(paste0(arg, "-Diagnosis"), paste0(arg, "-Relapse"))))
+
+flow_pos_data <- flow_pos_data %>%
+  dplyr::group_by(ag) %>%
+  dplyr::slice(match(myorder, sample_id)) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-patient, -time) %>%
+  dplyr::mutate(sample_id = factor(sample_id, levels = myorder)) %>%
+  tidyr::pivot_wider(values_from = flow_antigen_density, names_from = sample_id) %>%
+  dplyr::mutate(assay = "flow_FMO")
+
+# create heatmaps
+heatdata <- dplyr::bind_rows(flow_pos_data, adt_matrix, flow_ag_data) %>%
+  dplyr::select(assay, ag, everything())
+
+row_ha <- rowAnnotation(
+  "Patient" = gsub("-Diagnosis|-Relapse", "", colnames(heatdata)[-c(1, 2)])
+)
+
+heatdata_list <- heatdata %>%
+  dplyr::group_by(assay) %>%
+  dplyr::group_split(.keep = TRUE) 
+
+list_names <- lapply(heatdata_list, function(arg) unique(arg$assay))
+heatdata_list <- lapply(heatdata_list, function(arg) arg %>% dplyr::select(-assay) %>% as.data.frame() %>% tibble::column_to_rownames("ag"))
+heatdata_list <- lapply(heatdata_list, t)
+names(heatdata_list) <- list_names
+
+heatdata_list[["ADT"]] <- heatdata_list[["ADT"]][, c("CD33", "CLL1", "EMR2", "CD123")]
+heatdata_list[["QuantiBRITE"]] <- heatdata_list[["QuantiBRITE"]][, c("CD33", "CLL1", "EMR2", "CD123")]
+heatdata_list[["QuantiBRITE"]][heatdata_list[["QuantiBRITE"]] > 5000] <- 5000
+heatdata_list[["flow_FMO"]] <- heatdata_list[["flow_FMO"]][, c("CD33", "CLL1", "EMR2", "CD123")]
+
+sample_ids <- colnames(heatdata)[-c(1, 2)]
+sample_ids <- sample_ids[grepl("Diagnosis", sample_ids)]
+
+patient_split <- gsub("-Diagnosis|-Relapse", "", myorder)
+patient_split <- factor(patient_split, levels = unique(patient_split), ordered = TRUE)
+
+heatmaps <- list()
+set.seed(42312)
+for (assay in c("ADT", "flow_FMO", "QuantiBRITE")) {
+  
+  input_matrix <- as.matrix(heatdata_list[[assay]]) %>% t()
+  rownames(input_matrix) <- case_when(rownames(input_matrix) %in% "CLL1" ~ "CLL-1",
+                                      rownames(input_matrix) %in% "EMR2" ~ "ADGRE2",
+                                      TRUE ~ rownames(input_matrix))
+  colnames(input_matrix) <- gsub("atient-", "", colnames(input_matrix))
+  colnames(input_matrix) <- gsub("iagnosis|elapse|-", "", colnames(input_matrix))
+  
+    col_fun <- colorRamp2(c(min(input_matrix, na.rm = TRUE),
+                            quantile(input_matrix, 0.25, na.rm = TRUE), 
+                            quantile(input_matrix, 0.75, na.rm = TRUE),
+                            max(input_matrix, na.rm = TRUE)), 
+                          c("steelblue3","steelblue3", "yellow1","yellow1"))
+  
+  # convert sample ID names of sample matrix
+  tmp_nam <- colnames(input_matrix)
+  tmp_nam <- unlist(lapply(tmp_nam, function(arg) {
+    new_id <- patient_id_map$patient_manuscript_id[patient_id_map$patient == gsub("D|R", "", arg)]
+    new_id <- paste0(new_id, ifelse(grepl("D$", arg), "D", "R"))
+    return(new_id)
+  }))
+  
+  colnames(input_matrix) <- tmp_nam
+  
+  heatmaps[[assay]] <- ComplexHeatmap::Heatmap(
+    
+    input_matrix,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    row_names_side = "left",
+    row_gap = unit(2, "mm"),
+    col = col_fun,
+    column_split = patient_split,
+    na_col = "gray96",
+    rect_gp = gpar(col = "black", lwd = 0.5),
+    heatmap_legend_param = list(
+      direction = "horizontal",  # Horizontal color bar
+      legend_width = unit(3, "cm"),
+      labels_rot = 45
+    )
+  )
+
+}
+
+heatmaps[["flow_FMO"]] %v% heatmaps[["QuantiBRITE"]] %v% heatmaps[["ADT"]]
+
+```
+
+## Correlation between CITEseq and flow cytometry
+```{r correlation_between_assays}
+
+cor_df <- heatdata %>%
+  dplyr::filter(assay %in% c("ADT", "QuantiBRITE")) %>%
+  tidyr::pivot_longer(cols = -c(assay, ag), names_to = "sample_id", values_to = "expression") %>%
+  tidyr::pivot_wider(names_from = "assay", values_from = "expression") %>%
+  dplyr::mutate(ag = case_when(ag %in% "CLL1" ~ "CLL-1", 
+                               ag %in% "EMR2" ~ "ADGRE2",
+                               TRUE ~ as.character(ag)),
+                ag = factor(ag, levels = c("CD33", "CLL-1", "CD123", "ADGRE2"))) %>%
+  dplyr::filter(!is.na(QuantiBRITE))
+
+ggscatter(data = cor_df,
+          x = "ADT",
+          y = "QuantiBRITE",
+          xlab = "Mean DSB-normalized ADT per blast (CITE-seq)",
+          ylab = "Mean antigen number per blast (Quantitative flow)",
+          ylim = c(100, 100000),
+          facet.by = "ag",
+          cor.coef = TRUE,
+          cor.method = "spearman",
+          add = "reg.line",
+          add.params = list(color = "blue"),
+          cor.coeff.args = list(label.x = 0, label.y = 4.9)) +
+  scale_y_log10(breaks = c(100, 1000, 10000, 100000), labels = c("100", "1,000", "10,000", "100,000"))
+
+```
+
+## Analysis of high-expressing Ags
+```{r analysis_high_expressing_antigens}
+
+sample_pb_adt <- AverageExpression(blast_object, group.by = "sample_id", assays = "ADT_dsb_qc_filter", return.seurat = TRUE)
+myfeatures <- rownames(sample_pb_adt@assays$ADT_dsb_qc_filter)
+myfeatures <- myfeatures[!grepl("ISOTYPE", myfeatures)]
+sample_pb_adt <- NormalizeData(sample_pb_adt, features = myfeatures, normalization.method = "RC", margin = 2)
+
+high_ags <- c("CD33", "CD45", "CD99", "CD44", "CD47", "CD49D")
+heatdata <- FetchData(sample_pb_adt, vars = high_ags, layer = "data") %>% t()
+heatdata <- heatdata[, order(heatdata["CD33", ], decreasing = TRUE)]
+
+# ADT heatmap
+column_ha <- HeatmapAnnotation(
+  "CD33>CD45" = factor(ifelse(heatdata["CD33", ] > heatdata["CD45", ], "Yes", "No"), levels = c("Yes", "No")),
+  col = list(`CD33>CD45` = c("Yes" = "black", "No" = "lightgray"))
+)
+
+Heatmap(
+  log10(heatdata),
+  name = "Relative\nexpression",  # This sets the main heatmap legend title
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  top_annotation = column_ha
+)
+
+# RNA heatmap
+sample_pb_adt <- AggregateExpression(blast_object, group.by = "sample_id", assays = "RNA", return.seurat = TRUE)
+myfeatures <- rownames(sample_pb_adt@assays$ADT)
+sample_pb_adt <- NormalizeData(sample_pb_adt, features = myfeatures, normalization.method = "LogNormalize", margin = 2)
+
+high_ags <- c("CD33", "PTPRC", "CD99", "CD44", "CD47", "ITGA4")
+heatdata <- FetchData(sample_pb_adt, vars = high_ags, layer = "data") %>% t()
+heatdata <- heatdata[, order(heatdata["CD33", ], decreasing = TRUE)]
+
+# heatmap
+column_ha <- HeatmapAnnotation(
+  "CD33>CD45" = factor(ifelse(heatdata["CD33", ] > heatdata["PTPRC", ], "Yes", "No"), levels = c("Yes", "No")),
+  col = list(`CD33>CD45` = c("Yes" = "black", "No" = "lightgray"))
+)
+
+Heatmap(
+  log10(heatdata),
+  name = "Relative\nexpression",  # This sets the main heatmap legend title
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  top_annotation = column_ha
+)
+
+# Surface expression of high expressing antigens in blasts compared to lymphocytes
+sample_pb_adt <- AggregateExpression(dplyr::filter(aml_data, cell_state_harmony_rna != "DP T cell"), group.by = "cell_state_harmony_rna", assays = "ADT", return.seurat = TRUE)
+myfeatures <- rownames(sample_pb_adt@assays$ADT)
+myfeatures <- myfeatures[!grepl("ISOTYPE", myfeatures)]
+sample_pb_adt <- NormalizeData(sample_pb_adt, features = myfeatures, normalization.method = "RC", margin = 2)
+
+high_ags <- c("CD33", "CD45", "CD99", "CD44", "CD47", "CD49D")
+heatdata <- FetchData(sample_pb_adt, vars = high_ags, layer = "data") %>% t()
+heatdata <- heatdata[, order(heatdata["CD33", ], decreasing = TRUE)]
+
+Heatmap(
+  log10(heatdata),
+  name = "Relative\nexpression",  # This sets the main heatmap legend title
+  cluster_rows = FALSE,
+  cluster_columns = FALSE
+)
+
+VlnPlot(dplyr::filter(aml_data, cell_state_harmony_rna != "DP T cell"), 
+        group.by = "cell_state_harmony_rna", 
+        assay = "ADT",
+        features = high_ags,
+        pt.size = 0)
+
+```
+
+# Mutation profiles
+```{bash variant_annotation, eval = FALSE}
+
+# the following bcltoosl command was used to filter ClinVar vcf file:
+docker run -ti -v /data/project_workspace/tmp:/tmp staphb/bcftools:latest bcftools view -W -o /tmp/clinvar_20250115_HP0004808_aml.vcf.gz -O z -i 'INFO/CLNDISDB~"Human_Phenotype_Ontology:HP:0004808" || INFO/SCIDISDB~"Human_Phenotype_Ontology:HP:0004808" || INFO/ONCDN~"Human_Phenotype_Ontology:HP:0004808" || INFO/CLNDISDBINCL~"Human_Phenotype_Ontology:HP:0004808" || INFO/ONCDISDB~"Human_Phenotype_Ontology:HP:0004808"' /tmp/clinvar_20250115.vcf.gz && \
+docker run -ti -v /data/project_workspace/tmp:/tmp staphb/bcftools:latest bcftools view -W -o /tmp/clinvar_20250115_HP0004808_AML_nonsynonymous.vcf.gz -O z -e 'INFO/MC~"SO:0001819|synonymous_variant"' /tmp/clinvar_20250115_HP0004808_aml.vcf.gz && \
+docker run -ti -v /data/project_workspace/tmp:/tmp pegi3s/picard:latest SortVcf -I /tmp/clinvar_20250115_HP0004808_AML_nonsynonymous.vcf.gz -O /tmp/clinvar_20250115_HP0004808_AML_nonsynonymous_sorted.vcf.gz
+
+# get genomic coordinates for mutations reported by UHN
+docker run -v /data/project_workspace/tmp:/ref zhouwanding/transvar:latest \
+   transvar panno -l /ref/uhn_ngs_variants.txt -g 2 -t 3 -m 5 --refseq --reference /ref/hg38.fa > uhn_ngs_variants_aa_anno.txt
+
+docker run -v /data/project_workspace/tmp:/ref zhouwanding/transvar:latest \
+   transvar canno -l /ref/uhn_ngs_variants.txt -g 2 -t 3 -m 4 --refseq --reference /ref/hg38.fa > uhn_ngs_variants_cdna_anno.txt
+   
+```
+
+## Summarize with heatmaps
+```{r mutation_profiles, fig.height = 5, fig.width = 12}
+
+# load cbioportal and clinvar vcf files with known AML-associated variants
+cbio_vcf <- aws.s3::s3read_using(FUN = read.delim,
+                                 skip = 211,
+                                 object = "s3://vorbio-bioinformatics/genomebrowser/cBioPortal/cBio_liftover_deduplicated_5926loci_6032mutations_manually_modified_header_sorted.vcf") %>%
+  dplyr::rename(CHROM = X.CHROM, INFO_cbioportal = INFO) %>%
+  dplyr::group_by(CHROM, POS) %>%
+  dplyr::mutate(number_mutations_per_gene = n()) %>%
+  dplyr::ungroup()
+
+clinvar_vcf_full <- aws.s3::s3read_using(FUN = read.delim,
+                                 skip = 41,
+                                 object = "s3://vorbio-bioinformatics/genomebrowser/ClinVar/clinvar_20250115.vcf.gz") %>%
+  dplyr::rename(CHROM = X.CHROM, INFO_clinvar = INFO)
+
+
+
+clinvar_vcf <- aws.s3::s3read_using(FUN = read.delim,
+                                 skip = 74,
+                                 object = "s3://vorbio-bioinformatics/genomebrowser/ClinVar/clinvar_20250115_HP0004808_AML_nonsynonymous_sorted.vcf.gz") %>%
+  dplyr::rename(CHROM = X.CHROM, INFO_clinvar = INFO) %>%
+  dplyr::select(CHROM, POS, REF, ALT, ID, INFO_clinvar) %>%
+  dplyr::mutate(CHROM = paste0("chr", CHROM)) %>%
+  dplyr::filter(grepl("pathogenic", INFO_clinvar, ignore.case = TRUE)) 
+
+stopifnot(all(grepl("Acute_myeloid_leukemia", clinvar_vcf$INFO)))
+stopifnot(all(!grepl("SO:0001819|synonymous_variant", clinvar_vcf$INFO)))
+
+# load Archer mutation vcf 
+read_archer_vcf <- function(vcf_file_path) {
+  
+  if (grepl("^s3", vcf_file_path)) {
+    myvcf <- aws.s3::s3read_using(FUN = vcfR::read.vcfR, object = vcf_file_path)
+  } else {
+    myvcf <- vcfR::read.vcfR(vcf_file_path)
+  }
+  
+  myvcf <- myvcf %>% vcfR2tidy(single_frame = TRUE) 
+  
+  gt <- myvcf$dat %>%
+    dplyr::filter(!is.na(gt_GT)) %>%
+    dplyr::mutate(gt_FREQ = num(as.numeric(gsub("%", "", gt_FREQ)), label = "%"), gt_PVAL = as.numeric(gt_PVAL)) %>%
+    dplyr::select(Indiv, CHROM, POS, gt_GT_alleles, REF, ALT, everything())
+  
+  return(gt)
+  
+}
+
+vcf_s3_paths <- c("s3://vorbio-analysis/amplicon_sequencing/241015-JMNNX-00781/2.8.1/VA_CALL/combine.mpileup.varscan.vcf",
+                  "s3://vorbio-analysis/amplicon_sequencing/240926-LWMNX-00777/2.8.1/VA_CALL/combine.mpileup.varscan.vcf")
+
+vcf_list <- lapply(vcf_s3_paths, read_archer_vcf)
+vcf_com <- do.call("bind_rows", vcf_list) %>%
+  dplyr::mutate(Indiv = ifelse(Indiv %in% "AH-AH-Patient-65-6D-20241015_S23", "AH-Patient-65-6R-20241015_S22", Indiv)) %>%
+  dplyr::filter(!Indiv %in% c("AH-archer-Patient-47-6D-20240925_S25", 
+                              "AH-archer-Patient-47-6R-20240925_S26",
+                              "AH-archer-Patient-48-6D-20240925_S27", 
+                              "AH-archer-Patient-48-6R-20240925_S28"))
+
+
+# use VEP to remove uninteresting mutations
+vep1 <- aws.s3::s3read_using(FUN = read.delim, skip = 55,
+                             object = "s3://vorbio-analysis/amplicon_sequencing/241015-JMNNX-00781/2.8.1/VA_VEP/Output.combine.Vep.raw.txt")
+vep2 <- aws.s3::s3read_using(FUN = read.delim, skip = 55,
+                             object = "s3://vorbio-analysis/amplicon_sequencing/240926-LWMNX-00777/2.8.1/VA_VEP/Output.combine.Vep.raw.txt")
+vep <- dplyr::bind_rows(vep1, vep2) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(gt_GT_alleles = gsub(".*_", "", x_uploaded_variation),
+                CHROM = gsub("\\:.*", "", location),
+                POS = as.integer(gsub(".*\\:|-.*", "", location)),
+                vep_insert_id = gsub(".*SYMBOL=|;SYMBOL_SOURCE.*", "", extra),
+                vep_insert_id = gsub("-.*", "", vep_insert_id)) %>%
+  dplyr::select(vep_insert_id, CHROM, POS, gt_GT_alleles, consequence) %>%
+  dplyr::distinct() %>%
+  dplyr::group_by(CHROM, POS, gt_GT_alleles) %>%
+  dplyr::reframe(vep_insert_id = paste(unique(vep_insert_id), collapse = ", "), 
+                 consequence = paste(unique(consequence), collapse = ",")) %>%
+  dplyr::mutate(gt_GT_alleles = str_replace(gt_GT_alleles, "^([^/]*/[^/]*)/", "\\1,")) %>%
+  tidyr::separate(gt_GT_alleles, into = c("REF", "ALT"), sep = "/", remove = TRUE)
+
+vcf_com <- dplyr::left_join(vcf_com, vep, by = c("CHROM", "POS", "REF", "ALT"))
+
+# load bed files for Archer vcf annotation
+bed_file_hg19 <- aws.s3::s3read_using(
+  FUN = read.delim,
+  header = FALSE,
+  object = "s3://vorbio-datascience/genomics/tmp/VariantPlex_MP00187_primers_target-v1.0 (1).bed") %>%
+  dplyr::arrange(V1, V2, V3)
+
+bed_file_hg38 <- aws.s3::s3read_using(
+  FUN = read.delim, 
+  header = FALSE, 
+  object = "s3://vorbio-bioinformatics/efs/reference/annotations/hg38/VariantPlex_AML_Custom_Panel_MP00187/VariantPlex_AML_Custom_Panel_MP00187_primers_target-v1.0.sort.hg38.bed")
+
+stopifnot(all(bed_file_hg19$V1 == bed_file_hg38$V1))
+
+bed_file_hg38 <- bed_file_hg38 %>%
+  dplyr::mutate(V5 = gsub("_.*", "", bed_file_hg19$V4))
+
+# get gene symbols for SNP IDs
+snp_table <- data.frame(id = unique(bed_file_hg38$V5)) %>% dplyr::filter(grepl("^rs",id))
+snp_table$gene <- c("PALLD")
+
+ensembl <- useMart("ensembl", host = "https://www.ensembl.org")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+gene_coord <- getBM(attributes = c('hgnc_symbol', 'chromosome_name', 'start_position', 'end_position'),
+                    mart = ensembl) %>%
+  dplyr::mutate(chromosome_name = paste0("chr", chromosome_name)) %>%
+  dplyr::filter(hgnc_symbol != "")
+
+# cross-reference mutations with UHN's NGS analysis
+# annotated transcript level ngs file provided by UHN
+uhn_vcf <- aws.s3::s3read_using(FUN = read.delim,
+                                object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/uhn_ngs_variants.txt")
+
+annot_list <- list()
+for (i in 1:nrow(uhn_vcf)) {
+  
+  cat("\r", i)
+  tmp <- uhn_vcf[i, ]
+  gene_sym <- tmp$gene
+  tx_id <- tmp$nm_transcript_id
+  variant_cdna <- tmp$variant_cdna
+  variant_aa <- tmp$variant_aa
+  
+  myinput <- paste(tx_id, variant_cdna, sep = ":")
+  mycommand <- glue::glue("transvar canno -i {myinput} --refseq --gseq --reference /home/rstudio/data/project_workspace/tmp/hg38.fa")
+  myout <- system(mycommand, intern = TRUE)
+  
+  if (length(myout) < 2) {
+    myinput <- paste(tx_id, variant_aa, sep = ":")
+    mycommand <- glue::glue("transvar panno -i {myinput} --refseq --gseq --reference /home/rstudio/data/project_workspace/tmp/hg38.fa")
+    myout <- system(mycommand, intern = TRUE)
+  }
+  
+  annot_list[[i]] <- myout[2]
+
+}
+
+uhn_vcf_annot <- lapply(annot_list, function(arg) unlist(strsplit(arg[1], split = "\t")))
+uhn_vcf_annot <- do.call("rbind", uhn_vcf_annot) %>% 
+  as_tibble %>%
+  dplyr::select(V8, V9, V10, V11, V7)
+colnames(uhn_vcf_annot) <- c("CHROM", "POS", "REF", "ALT", "INFO_UHN")
+
+uhn_vcf_annot <- cbind(uhn_vcf, uhn_vcf_annot) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(CHROM = ifelse(INFO_UHN == "no_valid_transcript_found" | grepl("Unclassified", INFO_UHN), NA, as.character(CHROM)),
+                POS = ifelse(INFO_UHN == "no_valid_transcript_found" | grepl("Unclassified", INFO_UHN), NA, POS),
+                REF = ifelse(INFO_UHN == "no_valid_transcript_found" | grepl("Unclassified", INFO_UHN), NA, as.character(REF)),
+                ALT = ifelse(INFO_UHN == "no_valid_transcript_found" | grepl("Unclassified", INFO_UHN), NA, as.character(ALT))) %>%
+  dplyr::ungroup() %>%
+  dplyr::rename(uhn_patient_id = patient_id)
+
+id_map <- aws.s3::s3read_using(read.csv,
+                                 object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_atlas_sample_metadata_2024-04-03.csv") %>%
+  dplyr::filter(!is.na(uhn_patient_id), grepl("Diagnosis", sample_id)) %>%
+  dplyr::select(uhn_patient_id, sample_id) %>%
+  dplyr::filter(grepl("Diagnosis", sample_id)) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(sample_id = gsub("_", "-", sample_id))
+
+uhn_vcf_annot <- dplyr::right_join(uhn_vcf_annot, id_map, by = c("uhn_patient_id")) %>%
+  dplyr::select(sample_id, everything()) %>%
+  dplyr::mutate(af = as.numeric(gsub("%", "", af)),
+                POS = as.integer(POS))
+
+# extract PCR mutation validation data from metadata
+metadata <- aws.s3::s3read_using(read.csv,
+                                 object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_atlas_sample_metadata_2024-04-03.csv") %>%
+  dplyr::mutate(sample_id = gsub("_", "-", sample_id))
+
+no_ngs_samples <- metadata$sample_id[is.na(metadata$other_mutations_ngs)]
+no_ngs_samples <- gsub("_", "-", no_ngs_samples)
+
+metadata <- metadata %>%
+  dplyr::select(sample_id, npm1, flt3_itd, flt3_tkd, kit, runx1, tp53) %>%
+  tidyr::pivot_longer(-c("sample_id"), names_to = "gene_pcr", values_to = "status") %>%
+  dplyr::mutate(gene_pcr = toupper(gene_pcr),
+                gene_pcr = gsub("_itd|_tkd", "", gene_pcr, ignore.case = TRUE))
+
+pcr_mutations <- dplyr::select(metadata, sample_id, gene_pcr, status) %>%
+  dplyr::filter(!grepl("undetectable|inconclusive", status, ignore.case = TRUE), !is.na(status)) %>%
+  distinct() %>%
+  dplyr::rename(gene = gene_pcr) %>%
+  dplyr::select(-status) %>%
+  dplyr::mutate(validation = "PCR") %>%
+  dplyr::left_join(id_map, by = c("sample_id"))
+
+uhn_vcf_annot <- dplyr::full_join(uhn_vcf_annot, pcr_mutations, by = c("sample_id", "gene", "uhn_patient_id"))
+
+# annotate Archer mutation vcf file
+blank_record <- tibble::tibble(CHROM = NA, 
+                               POS = NA, REF = NA, 
+                               ALT_cbioportal = NA, 
+                               INFO_cbioportal = NA, 
+                               ALT_clinvar = NA, 
+                               INFO_clinvar = NA, 
+                               POS_cbioportal = NA, 
+                               REF_cbioportal = NA, 
+                               POS_clinvar = NA, 
+                               REF_clinvar = NA)
+
+insert_id <- rep(NA, nrow(vcf_com))
+in_cbio <- rep(NA, nrow(vcf_com))
+db_records <- as.list(rep(NA, nrow(vcf_com)))
+indel_sequence_flank_length <- 5
+for (i in 1:nrow(vcf_com)) {
+  
+  cat("\r", i)
+  chr <- vcf_com$CHROM[i]
+  pos <- vcf_com$POS[i]
+  insert_name <- bed_file_hg38$V5[bed_file_hg38$V1 == chr & bed_file_hg38$V2 <= pos & bed_file_hg38$V3 >= pos]
+  gene_name <- gene_coord$hgnc_symbol[gene_coord$chromosome_name == chr & gene_coord$start_position <= pos & gene_coord$end_position >= pos] %>% unique()
+  
+  if (length(gene_name) == 1) {
+    insert_id[i] <- gene_name
+  } else {
+    insert_id[i] <- insert_name
+  }
+  
+  ref <- vcf_com$REF[i]
+  alt <- vcf_com$ALT[i]
+  alt <- unlist(strsplit(alt, split = ","))
+  
+  cbioportal_rec <- dplyr::filter(cbio_vcf, CHROM == chr, POS == pos, REF == ref, ALT %in% alt) %>%
+    dplyr::select(-ID, -QUAL, -FILTER) %>%
+    dplyr::group_by(CHROM, POS, REF) %>%
+    dplyr::reframe(ALT = paste(ALT, collapse = ","), INFO_cbioportal = paste(INFO_cbioportal, collapse = " / "))
+  
+  clinvar_rec <- dplyr::filter(clinvar_vcf, CHROM == chr, POS == pos, REF == ref, ALT %in% alt) %>%
+    dplyr::group_by(CHROM, POS, REF) %>%
+    dplyr::reframe(ALT = paste(ALT, collapse = ","), INFO_clinvar = paste(INFO_clinvar, collapse = " / "))
+  
+  db_record <- dplyr::full_join(cbioportal_rec, clinvar_rec, by = c("CHROM", "POS", "REF"), suffix = c("_cbioportal", "_clinvar"))
+  stopifnot(nrow(db_record) < 2)
+  # check if allele is indel
+  indel_present <- (!(all(lapply(alt, nchar) == 1))) | (nchar(ref) > 1)
+  
+  if (nrow(db_record) == 0 & indel_present) {
+    
+    cbioportal_rec <- dplyr::filter(cbio_vcf, 
+                                    CHROM == chr, 
+                                    (POS < (pos + indel_sequence_flank_length)) & (POS > (pos - indel_sequence_flank_length)), 
+                                    grepl("TERM\\=INS|TERM\\=DEL", INFO_cbioportal)) %>%
+      dplyr::select(-ID, -QUAL, -FILTER) %>%
+
+      dplyr::reframe(CHROM = unique(CHROM), 
+                     POS = paste(unique(POS), collapse = ","), 
+                     REF = paste(unique(REF), collapse = ","), 
+                     ALT = paste(unique(ALT), collapse = ","), 
+                     INFO_cbioportal = paste(INFO_cbioportal, collapse = " / "))
+    
+    clinvar_rec <- dplyr::filter(clinvar_vcf, 
+                                 CHROM == chr, 
+                                 (POS < (pos + indel_sequence_flank_length)) & (POS > (pos - indel_sequence_flank_length)), 
+                                 grepl("CLNVC=Deletion|CLNVC=Duplication|CLNVC=Indel|CLNVC=Insertion|CLNVC=Microsatellite", INFO_clinvar)) %>%
+      dplyr::reframe(CHROM = unique(CHROM),
+                     POS = paste(unique(POS), collapse = ","), 
+                     REF = paste(unique(REF), collapse = ","), 
+                     ALT = paste(unique(ALT), collapse = ","), 
+                     INFO_clinvar = paste(INFO_clinvar, collapse = " / "))
+    
+    db_record_indel <- dplyr::full_join(cbioportal_rec, clinvar_rec, by = c("CHROM"), suffix = c("_cbioportal", "_clinvar"))
+    stopifnot(nrow(db_record_indel) < 2)
+    
+    if (nrow(db_record_indel) > 0) {
+      db_records[[i]] <- db_record_indel
+    } else {
+      db_records[[i]] <- blank_record
+    }
+    
+  } else if (nrow(db_record) == 0) {
+      db_records[[i]] <- blank_record 
+  } else {
+    db_records[[i]] <- db_record
+  }
+
+}
+
+db_records_df <- do.call("bind_rows", db_records) %>%
+  dplyr::mutate(insert_id = insert_id) %>%
+  dplyr::select(insert_id, POS_cbioportal, REF_cbioportal, ALT_cbioportal, INFO_cbioportal,
+                POS_clinvar, REF_clinvar, ALT_clinvar, INFO_clinvar)
+
+vcf_com_annot <- vcf_com %>%
+  dplyr::bind_cols(db_records_df) %>%
+  dplyr::mutate(sample_id = gsub("AH-|AH-archer-", "", Indiv),
+                sample_id = gsub("-2024.*", "", sample_id),
+                sample_id = gsub("6D|1D", "Diagnosis", sample_id),
+                sample_id = gsub("6R|1R", "Relapse", sample_id))
+
+# some records may not have VEP annotation due to difference in indel
+vcf_com_annot_na <- dplyr::filter(vcf_com_annot, is.na(consequence))
+
+
+
+
+
+
+flagged_records <- vcf_com_annot %>%
+  fuzzyjoin::fuzzy_right_join(uhn_vcf_annot,
+                              by = c("sample_id", "insert_id" = "gene", "CHROM", "POS"),
+                              match_fun = list(`==`, `==`, `==`, function(x, y) abs(x - y) <= indel_sequence_flank_length)) %>%
+  dplyr::mutate(alt_match_db = case_when(!is.na(INFO_cbioportal) & !is.na(INFO_clinvar) ~ "all",
+                                         !is.na(INFO_cbioportal) ~ "cbioportal",
+                                         !is.na(INFO_clinvar) ~ "clinvar")) %>%
+  dplyr::filter((is.na(sample_id.x) & !is.na(sample_id.y)),
+                !is.na(variant_cdna))
+
+# annotate Archer vcf with UHN NGS data after conversion with transvar
+sample_mut <- vcf_com_annot %>%
+  fuzzyjoin::fuzzy_left_join(uhn_vcf_annot,
+                              by = c("sample_id", "insert_id" = "gene", "CHROM", "POS"),
+                              match_fun = list(`==`, `==`, `==`, function(x, y) abs(x - y) <= indel_sequence_flank_length)) %>%
+  dplyr::mutate(alt_match_db = case_when(!is.na(INFO_cbioportal) & !is.na(INFO_clinvar) ~ "all",
+                                         !is.na(INFO_cbioportal) ~ "cbioportal",
+                                         !is.na(INFO_clinvar) ~ "clinvar")) %>%
+  dplyr::select(Indiv, insert_id, gt_FREQ, gt_PVAL, alt_match_db, consequence) %>%
+  dplyr::filter(!is.na(alt_match_db)) %>%
+  dplyr::filter(grepl("missense_variant|splice_region_variant|inframe_insertion|stop_gained|frameshift_variant|inframe_deletion|splice_polypyrimidine_tract_variant", consequence) | is.na(consequence)) %>%
+  dplyr::group_by(Indiv, insert_id) %>% 
+  dplyr::slice(which.min(gt_PVAL)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(Indiv = gsub("AH-|-2024.*|archer-", "", Indiv),
+                Indiv = gsub("6D|1D", "Diagnosis", Indiv),
+                Indiv = gsub("6R|1R", "Relapse", Indiv),
+                time = ifelse(grepl("Relapse", Indiv), "R", "D"),
+                patient = gsub("-Relapse|-Diagnosis", "", Indiv),
+                patient = gsub("Patient-", "P", patient)) %>%
+  dplyr::left_join(patient_id_map, by = "patient") %>%
+  dplyr::filter(!is.na(patient_manuscript_id)) %>%
+  dplyr::arrange(patient_manuscript_id) %>%
+  dplyr::mutate(sample_id = paste(patient_manuscript_id, time, sep = "")) %>%
+  dplyr::select(sample_id, insert_id, gt_FREQ)
+
+
+# plot VAF heatmap
+sample_mut <- sample_mut %>%
+  tidyr::pivot_wider(values_from = gt_FREQ, names_from = insert_id, values_fill = 0) %>%
+  dplyr::select(sample_id, everything()) %>%
+  #dplyr::bind_rows(data.frame(sample_id = c("P60D", "P60R"))) %>%
+  tibble::column_to_rownames("sample_id") %>%
+  t()
+
+
+rsplit <- gsub("D$|R$", "", colnames(sample_mut))
+rsplit <- factor(rsplit, levels = unique(rsplit))
+
+sample_mut <- sample_mut[order(rowSums(sample_mut > 5, na.rm = TRUE), decreasing = TRUE), ]
+sample_mut <- sample_mut[rowSums(sample_mut > 1, na.rm = TRUE) > 1, ]
+
+heatdata <- sample_mut          
+ComplexHeatmap::Heatmap(
+  heatdata, 
+  cluster_rows = FALSE, 
+  cluster_columns = FALSE, 
+  column_split = rsplit, 
+  column_gap = unit(2, "mm"),
+  col = c("white", "cornflowerblue", "red"),
+  rect_gp = gpar(col = "black", lwd = 0.5),
+  row_names_side = "left",
+  na_col = "lightgray"
+)
+
+```
+
+## Correlate mutations with cell state composition in blasts
+```{r mutations_cell_state, fig.width=6, fig.height=5}
+
+mut_df <- sample_mut %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("sample_manuscript_id") %>%
+  dplyr::mutate(time = ifelse(grepl("D$", sample_manuscript_id), "Dx", "Re")) %>%
+  dplyr::mutate(patient_manuscript_id = gsub("D$|R$", "", sample_manuscript_id)) %>%
+  dplyr::left_join(cluster_summary, by = c("patient_manuscript_id", "time")) %>%
+  dplyr::group_by(sample_manuscript_id) %>%
+  dplyr::mutate(shannon_index = vegan::diversity(count, index = "shannon"),
+                simpson_index = vegan::diversity(count, index = "simpson")) %>%
+  dplyr::ungroup()
+
+# tumor suppressors and oncogenic signaling
+plotdf <- mut_df %>%
+  dplyr::select(sample_manuscript_id, SRSF2,  NPM1, IDH1, ASXL1, FLT3, IDH2, KIT, NRAS, DNMT3A, TP53, TET2, SF3B1, RUNX1, WT1, STAG2, JAK2, CEBPA, shannon_index, simpson_index) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(mut_gp = case_when((TP53 > 1 | TET2 > 1 | WT1 > 1) & (KIT > 1 | FLT3 > 1) ~ "Tumor suppressor and\noncogenic signaling",
+                                   TP53 > 1 | TET2 > 1 | WT1 > 1 ~ "Tumor suppressor\n(TP53, TET2, WT1)", 
+                                   KIT > 1 | FLT3 > 1 ~ "Oncogenic signaling\n(FLT3, KIT)",
+                                   TRUE ~ "Other mutations"),
+                mut_gp = factor(mut_gp, levels = c("Tumor suppressor\n(TP53, TET2, WT1)",
+                                                   "Oncogenic signaling\n(FLT3, KIT)",
+                                                   "Tumor suppressor and\noncogenic signaling",
+                                                   "Other mutations")),
+                time = ifelse(grepl("D$", sample_manuscript_id), "Diagnosis", "Relapse")) %>%
+  dplyr::filter(!is.na(mut_gp))
+
+comparisons <- list(c("Tumor suppressor\n(TP53, TET2, WT1)", "Other mutations"))
+
+xplot <- ggboxplot(dplyr::filter(plotdf, time == "Diagnosis"), 
+          x = "mut_gp", 
+          y = "shannon_index",
+          ylim = c(0, 2.1),
+          xlab = "",
+          ylab = "Blast state diversity (Shannon index)",
+          fill = "mut_gp",  # Color by group
+          palette = "uchicago",  # Use a clean color palette
+          add = "jitter",   # Add jitter points
+          add.params = list(alpha = 0.5, size = 1.8, width = 0.2)) +  # Adjust jitter aesthetics
+  stat_compare_means(mapping = aes(label = paste0("p = ", ..p.format..)), comparisons = comparisons, method = "t.test") +  # Show p-values for significance
+  theme_bw(base_size = 14) +  # Apply a clean minimal theme
+  theme(legend.position = "none")
+
+comparisons <- list(c("Tumor suppressor\n(TP53, TET2, WT1)", "Other mutations"), 
+                    c("Oncogenic signaling\n(FLT3, KIT)", "Other mutations"))
+
+yplot <- ggboxplot(dplyr::filter(plotdf, time == "Relapse"), 
+          x = "mut_gp", 
+          y = "shannon_index",
+          ylim = c(0, 2.1),
+          xlab = "",
+          ylab = "",
+          fill = "mut_gp",  # Color by group
+          palette = "uchicago",  # Use a clean color palette
+          add = "jitter",   # Add jitter points
+          add.params = list(alpha = 0.5, size = 1.8, width = 0.2)) +  # Adjust jitter aesthetics
+  stat_compare_means(mapping = aes(label = paste0("p = ", ..p.format..)), comparisons = comparisons, method = "t.test") +  # Show p-values for significance
+  theme_bw(base_size = 14) +  # Apply a clean minimal theme
+    guides(fill = guide_legend(title = "")) +
+theme(
+    legend.position = "top",               # Place legend at the top
+    legend.justification = "right",         # Center the legend
+    legend.box = "horizontal",             # Arrange legend items horizontally
+    legend.key.size = unit(1, "cm"),
+  )
+  
+  
+xplot + yplot
+
+# Oncogenic signaling
+plotdf <- mut_df %>%
+  dplyr::select(sample_manuscript_id, SRSF2,  NPM1, IDH1, ASXL1, FLT3, IDH2, KIT, NRAS, DNMT3A, TP53, TET2, SF3B1, RUNX1, WT1, STAG2, JAK2, CEBPA, shannon_index, simpson_index) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(mut_gp = factor(ifelse(KIT > 1 | FLT3 > 1, "Signal transduction\n(KIT, FLT3)", "Other"), levels = c("Signal transduction\n(KIT, FLT3)", "Other"))) %>%
+  dplyr::filter(!is.na(mut_gp))
+
+ggboxplot(plotdf, 
+          x = "mut_gp", 
+          y = "shannon_index",
+          xlab = "",
+          ylab = "Blast state diversity (Shannon index)",
+          fill = "mut_gp",  # Color by group
+          palette = "uchicago",  # Use a clean color palette
+          add = "jitter",   # Add jitter points
+          shape = 21,       # Hollow circles
+          add.params = list(alpha = 0.5, size = 1.8, width = 0.2)) +  # Adjust jitter aesthetics
+  stat_compare_means(label.x = 0.7, label.y = 0.1, mapping = aes(label = paste0("p = ", ..p.format..))) +  # Show p-values for significance
+  theme_classic(base_size = 14) +  # Apply a clean minimal theme
+  theme(legend.position = "none")
+
+# NPM1
+plotdf <- mut_df %>%
+  dplyr::select(sample_manuscript_id, SRSF2,  NPM1, IDH1, ASXL1, FLT3, IDH2, KIT, NRAS, DNMT3A, TP53, TET2, SF3B1, RUNX1, WT1, STAG2, JAK2, CEBPA, shannon_index, simpson_index) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(mut_gp = factor(ifelse(NPM1 > 1, "NPM1", "Other"), levels = c("NPM1", "Other"))) %>%
+  dplyr::filter(!is.na(mut_gp))
+
+ggboxplot(plotdf, 
+          x = "mut_gp", 
+          y = "shannon_index",
+          xlab = "",
+          ylab = "Clonality (Shannon index)",
+          fill = "mut_gp",  # Color by group
+          palette = "uchicago",  # Use a clean color palette
+          add = "jitter",   # Add jitter points
+          shape = 21,       # Hollow circles
+          add.params = list(alpha = 0.5, size = 1.8, width = 0.2)) +  # Adjust jitter aesthetics
+  stat_compare_means(label.x = 0.7, label.y = 0.1, mapping = aes(label = paste0("p = ", ..p.format..))) +  # Show p-values for significance
+  theme_classic(base_size = 14) +  # Apply a clean minimal theme
+  theme(legend.position = "none")
+
+# Transcription factors
+plotdf <- mut_df %>%
+  dplyr::select(sample_manuscript_id, SRSF2,  NPM1, IDH1, ASXL1, FLT3, IDH2, KIT, NRAS, DNMT3A, TP53, TET2, SF3B1, RUNX1, WT1, STAG2, JAK2, CEBPA, shannon_index, simpson_index) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(mut_gp = factor(ifelse(RUNX1 > 1 | CEBPA > 1, "TFs", "Other"), levels = c("TFs", "Other"))) %>%
+  dplyr::filter(!is.na(mut_gp))
+
+ggboxplot(plotdf, 
+          x = "mut_gp", 
+          y = "shannon_index",
+          xlab = "",
+          ylab = "Clonality (Shannon index)",
+          fill = "mut_gp",  # Color by group
+          palette = "uchicago",  # Use a clean color palette
+          add = "jitter",   # Add jitter points
+          shape = 21,       # Hollow circles
+          add.params = list(alpha = 0.5, size = 1.8, width = 0.2)) +  # Adjust jitter aesthetics
+  stat_compare_means(label.x = 0.7, label.y = 0.1, mapping = aes(label = paste0("p = ", ..p.format..))) +  # Show p-values for significance
+  theme_classic(base_size = 14) +  # Apply a clean minimal theme
+  theme(legend.position = "none")
+
+# Splicing
+plotdf <- mut_df %>%
+  dplyr::select(sample_manuscript_id, SRSF2,  NPM1, IDH1, ASXL1, FLT3, IDH2, KIT, NRAS, DNMT3A, TP53, TET2, SF3B1, RUNX1, WT1, STAG2, JAK2, CEBPA, shannon_index, simpson_index) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(mut_gp = factor(ifelse(SRSF2 > 1 | SF3B1 > 1, "Splicing", "Other"), levels = c("Splicing", "Other"))) %>%
+  dplyr::filter(!is.na(mut_gp))
+
+ggboxplot(plotdf, 
+          x = "mut_gp", 
+          y = "shannon_index",
+          xlab = "",
+          ylab = "Clonality (Shannon diversity index)",
+          fill = "mut_gp",  # Color by group
+          palette = "uchicago",  # Use a clean color palette
+          add = "jitter",   # Add jitter points
+          shape = 21,       # Hollow circles
+          add.params = list(alpha = 0.5, size = 1.8, width = 0.2)) +  # Adjust jitter aesthetics
+  stat_compare_means(label.x = 0.7, label.y = 0.1, mapping = aes(label = paste0("p = ", ..p.format..))) +  # Show p-values for significance
+  theme_classic(base_size = 14) +  # Apply a clean minimal theme
+  theme(legend.position = "none")
+
+# Epigenetic modifiers
+plotdf <- mut_df %>%
+  dplyr::select(sample_manuscript_id, SRSF2,  NPM1, IDH1, ASXL1, FLT3, IDH2, KIT, NRAS, DNMT3A, TP53, TET2, SF3B1, RUNX1, WT1, STAG2, JAK2, CEBPA, shannon_index, simpson_index) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(mut_gp = factor(ifelse(DNMT3A > 1 | IDH1 > 1 | IDH2 > 1, "Epigenetic\nmodifiers", "Other"), levels = c("Epigenetic\nmodifiers", "Other"))) %>%
+  dplyr::filter(!is.na(mut_gp))
+
+ggboxplot(plotdf, 
+          x = "mut_gp", 
+          y = "shannon_index",
+          xlab = "",
+          ylab = "Clonality (Shannon diversity index)",
+          fill = "mut_gp",  # Color by group
+          palette = "uchicago",  # Use a clean color palette
+          add = "jitter",   # Add jitter points
+          shape = 21,       # Hollow circles
+          add.params = list(alpha = 0.5, size = 1.8, width = 0.2)) +  # Adjust jitter aesthetics
+  stat_compare_means(label.x = 0.7, label.y = 0.1, mapping = aes(label = paste0("p = ", ..p.format..))) +  # Show p-values for significance
+  theme_classic(base_size = 14) +  # Apply a clean minimal theme
+  theme(legend.position = "none")
+
+```
+
+## Correlate mutations with surface antigens
+```{r mutations_cell_state, fig.width=6, fig.height=5}
+
+markers_remove <- c("ISOTYPE-IGG1K", "ISOTYPE-RAT", "ISOTYPE-ARMENIAN-HAMSTER", "CD4", "CD4B", "CD3", "CD8", "CD8A", "CD19", "CD5", "CD71", "CD235A", "CD22", "CD3")
+
+plotdf <- mut_df %>%
+  dplyr::select(sample_id, SRSF2,  NPM1, IDH1, ASXL1, FLT3, IDH2, KIT, NRAS, DNMT3A, TP53, TET2, SF3B1, RUNX1, WT1, STAG2, JAK2, CEBPA) %>%
+  dplyr::distinct()
+
+ref_samples <- plotdf$sample_id[plotdf$DNMT3A > 1 | plotdf$IDH1 > 1 | plotdf$IDH2 > 1]
+ref_samples <- plotdf$sample_id[plotdf$TP53 > 1]
+ref_samples <- ref_samples[!is.na(ref_samples)]
+
+hsc_object <- blast_object %>%
+  dplyr::mutate(de_group = ifelse(sample_manuscript_id %in% ref_samples, "mutant", "wt"))
+
+mymarkers <- rownames(hsc_object@assays$ADT)
+mymarkers <- mymarkers[!grepl("isotype", mymarkers, ignore.case = TRUE)]
+hsc_pb <- AggregateExpression(hsc_object, features = mymarkers, group.by = "sample_manuscript_id", assay = "ADT", return.seurat = TRUE)
+hsc_pb <- NormalizeData(hsc_pb, method = "CLR", margin = 2, assay = "ADT")
+hsc_pb <- hsc_pb %>% dplyr::mutate(de_group = ifelse(sample_manuscript_id %in% ref_samples, "mutant", "wt")) 
+
+DefaultAssay(hsc_pb) = "ADT"
+Idents(hsc_pb) = "de_group"
+toptab <- FindMarkers(hsc_pb,
+                      ident.1 = "mutant",
+                      ident.2 = "wt",
+                      test.use = "wilcox_limma") %>%
+  dplyr::arrange(p_val)
+
+VlnPlot(hsc_pb, group.by = "de_group", features = rownames(toptab)[toptab$p_val_adj < 0.1])
+
+
+# Correlation matrix
+mat1 <- sample_mut %>%
+  t()
+mat2 <- FetchData(hsc_pb, assay = "ADT", layer = "data", vars = rownames(hsc_pb@assays$ADT))[rownames(mat1), ]
+cor_mat <- cor(mat1, mat2, method = "spearman")
+
+
+
+
+
+
+
+
+
+
+vaf_df <- plotdf %>% as.data.frame() %>% tibble::column_to_rownames("sample_id")
+adt_expr <- as.data.frame(t(hsc_pb@assays$ADT$data)) 
+samp_int <- intersect(rownames(vaf_df), rownames(adt_expr))
+samp_int <- sort(samp_int)
+adt_expr <- adt_expr[samp_int, !colnames(adt_expr) %in% markers_remove]
+vaf_df <- vaf_df[samp_int, ]
+test_res <- NULL
+for (variant in colnames(vaf_df)) {
+  for (ag in colnames(adt_expr)) {
+    variant_profile <- vaf_df[, variant]
+    variant_profile <- ifelse(variant_profile > 1, 1, 0)
+    variant_profile <- factor(variant_profile, levels = c(1, 0))
+    tres <- t.test(adt_expr[, ag] ~ variant_profile)
+    test_res[[paste(variant, ag, sep = "_")]] <- data.frame(variant = variant, 
+                                                            ag = ag, statistic = tres$statistic, 
+                                                            p_value = tres$p.value)
+  }
+}
+
+test_res <- dplyr::bind_rows(test_res) %>% 
+  dplyr::arrange(p_value) %>%
+  dplyr::mutate(adj_p = p.adjust(.$p_value, method = "BH")) %>%
+  dplyr::filter(adj_p < 0.05)
+
+res_mat <- test_res %>%
+  dplyr::select(variant, ag, statistic) %>%
+  tidyr::pivot_wider(names_from = ag, values_from = statistic, values_fill = 0) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("variant")
+
+res_mat[res_mat > 0] <- 1
+res_mat[res_mat < 0] <- -1
+pheatmap(res_mat, color = c("blue", "white", "red"))
+
+
+
+# Look into LSC fraction
+
+ref_samples <- plotdf$sample_id[plotdf$DNMT3A > 1]
+ref_samples <- ref_samples[!is.na(ref_samples)]
+tmpdf <- blast_object@meta.data %>%
+  dplyr::select(sample_id, barcode, lsc, predicted_id) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::summarize(lsc_fraction = sum(lsc == "LSC") / n()) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(mutant_group = ifelse(sample_id %in% gsub("-", "_", ref_samples), "mutant", "wt"))
+
+ggboxplot(tmpdf, 
+          x = "mutant_group", 
+          y = "lsc_fraction",
+          fill = "mutant_group",  # Color by group
+          palette = "uchicago",  # Use a clean color palette
+          add = "jitter",   # Add jitter points
+          shape = 21,       # Hollow circles
+          add.params = list(alpha = 0.5, size = 1.8, width = 0.2)) +  # Adjust jitter aesthetics
+  stat_compare_means(label.x = 0.7, label.y = 0.1, mapping = aes(label = paste0("p = ", ..p.format..))) +  # Show p-values for significance
+  theme_classic(base_size = 14) +  # Apply a clean minimal theme
+  theme(legend.position = "none")
+
+
+```
+
+
+
+
+# UMAP plots of selected patients with compositional changes
+```{r global_umap}
+
+blast_object <- dplyr::left_join(blast_object, 
+                                 dplyr::mutate(patient_id_map,
+                                               patient = gsub("^P", "Patient_", patient), 
+                                               by = "patient"))
+DefaultAssay(blast_object) <- "RNA"
+blast_object <- FindVariableFeatures(blast_object, nfeatures = 1000)
+blast_object <- ScaleData(blast_object, vars.to.regress = "patient_manuscript_id")
+blast_object <- RunPCA(blast_object, seed.use = 3142)
+blast_object <- RunUMAP(blast_object, dims = 1:30, seed.use = 45751, repulsion = 3, n.neighbors = 40, spread = 3)
+
+
+DimPlot(blast_object, reduction = "umap", group.by = "patient_manuscript_id", label = TRUE, repel = TRUE, alpha = 0.2) + NoLegend() + NoAxes() + ggtitle(NULL)
+
+DimPlot(blast_object, reduction = "umap", group.by = "time", alpha = 0.2, cols = c("#0073C2FF", "#EFC000FF"), shuffle = TRUE) + NoLegend() + NoAxes() + ggtitle(NULL)
+
+
+
+
+blast_object <- blast_object %>%
+  dplyr::mutate(broad_cell_state = dplyr::case_when(predicted_id %in% c("NK", 
+                                                                        "NKT", 
+                                                                        "B cell", 
+                                                                        "CD4+ T", 
+                                                                        "CD4+ memory T", 
+                                                                        "CD8+ T", 
+                                                                        "CD8+ memory T", 
+                                                                        "CD4+ naive T", 
+                                                                        "CD8+ naive T") ~ "Lymphoid", 
+                                                    TRUE ~ as.character(predicted_id)),
+                broad_cell_state = factor(broad_cell_state, levels = c("HSC", 
+                                                                       "GMP", 
+                                                                       "MEP", 
+                                                                       "Monocyte", 
+                                                                       "cDC", 
+                                                                       "pDC", 
+                                                                       "preMegakaryocyte", 
+                                                                       "preB", 
+                                                                       "Erythroblast", 
+                                                                       "Erythroid", 
+                                                                       "Lymphoid")))
+
+DimPlot(filter(blast_object, patient_manuscript_id == "P01"), reduction = "umap", group.by = "broad_cell_state", alpha = 0.2, cols = mycols) + 
+  NoLegend() + NoAxes() + ggtitle(NULL)
+
+```
+
+```{r feature_plot_selected_patients}
+
+color_map <- data.frame(cell_states, colors = mycols[1:length(cell_states)])
+
+pat58 <- dplyr::filter(blast_object, patient == "Patient_58") 
+DefaultAssay(pat58) <- "RNA"
+
+pat58 <- pat58 %>%
+  FindVariableFeatures() %>%
+  NormalizeData() %>%
+  ScaleData()
+
+pat58 <- RunPCA(pat58)
+pat58 <- RunUMAP(pat58, dims = 1:50)
+DimPlot(dplyr::filter(pat58, predicted_id %in% c("HSC", "MEP", "GMP", "Monocyte", "cDC", "pDC")) %>% 
+          dplyr::mutate(predicted_id = factor(predicted_id, levels = c("HSC", "GMP", "MEP", "Monocyte", "cDC", "pDC"))), 
+        split.by = "time", 
+        group.by = "predicted_id", 
+        reduction = "umap", 
+        cols = mycols,
+        ncol = 1) + NoAxes() + 
+  theme(strip.text.x = element_blank())
+
+
+pat44 <- dplyr::filter(blast_object, patient == "Patient_44") 
+DefaultAssay(pat44) <- "RNA"
+
+pat44 <- pat44 %>%
+  FindVariableFeatures() %>%
+  NormalizeData() %>%
+  ScaleData()
+
+pat44 <- RunPCA(pat44)
+pat44 <- RunUMAP(pat44, dims = 1:50)
+
+DimPlot(dplyr::filter(pat44, predicted_id %in% c("HSC", "MEP", "GMP", "Monocyte", "cDC", "pDC")) %>% 
+          dplyr::mutate(predicted_id = factor(predicted_id, levels = c("HSC", "GMP", "MEP", "Monocyte", "cDC", "pDC"))), 
+        split.by = "time", 
+        group.by = "predicted_id", 
+        reduction = "umap", 
+        cols = mycols,
+        ncol = 1) + NoAxes() + 
+  theme(strip.text.x = element_blank())
+
+pat70 <- dplyr::filter(blast_object, patient == "Patient_70") 
+DefaultAssay(pat70) <- "RNA"
+
+pat70 <- pat70 %>%
+  FindVariableFeatures() %>%
+  NormalizeData() %>%
+  ScaleData()
+
+pat70 <- RunPCA(pat70)
+pat70 <- RunUMAP(pat70, dims = 1:50)
+
+DimPlot(dplyr::filter(pat70, predicted_id %in% c("HSC", "MEP", "GMP", "Monocyte", "cDC", "pDC")) %>% 
+          dplyr::mutate(predicted_id = factor(predicted_id, levels = c("HSC", "GMP", "MEP", "Monocyte", "cDC", "pDC"))), 
+        split.by = "time", 
+        group.by = "predicted_id", 
+        reduction = "umap", 
+        cols = mycols,
+        ncol = 1) + NoAxes() + 
+  theme(strip.text.x = element_blank())
+
+
+
+blast_object_filt <- dplyr::filter(blast_object, patient %in% c("Patient_44", "Patient_58", "Patient_61", "Patient_70", "Patient_43"),
+                                   predicted_id %in% c("HSC", "MEP", "GMP", "PreB", "Erythroblast", "Monocyte", "cDC", "pDC"))
+blast_object_filt <- SplitObject(blast_object_filt, split.by = "patient")
+mycols <- c("firebrick1", "seagreen3", "lightcyan3", "cyan", "purple", "hotpink", "gold1", "mediumturquoise", "yellow2", "sienna3", "springgreen", "olivedrab", "orange1",  "cornflowerblue", "rosybrown1", "maroon2", "slateblue2", "tan2", "peachpuff1", "orchid1", "yellowgreen", "burlywood2")
+
+object_list <- lapply(blast_object_filt, function(arg) {
+  
+  arg <- arg %>%
+    FindVariableFeatures() %>%
+    NormalizeData() %>%
+    ScaleData() %>%
+    RunPCA() %>%
+    RunUMAP(dims = 1:50) %>%
+    dplyr::mutate(predicted_id = factor(predicted_id, levels = c("HSC", "GMP", "MEP", "PreB", "Erythroblast", "Monocyte", "cDC", "pDC")))
+  
+})
+  
+DimPlot(object_list[["Patient_44"]], 
+        group.by = "predicted_id", 
+        cols = mycols,
+        reduction = "umap") + NoAxes() + NoLegend() + ggtitle(NULL)
+
+DimPlot(object_list[["Patient_58"]], 
+        group.by = "predicted_id", 
+        cols = mycols,
+        reduction = "umap") + NoAxes() + NoLegend() + ggtitle(NULL)
+
+DimPlot(object_list[["Patient_61"]], 
+        group.by = "predicted_id", 
+        cols = mycols,
+        reduction = "umap") + NoAxes() + NoLegend() + ggtitle(NULL)
+
+DimPlot(object_list[["Patient_70"]], 
+        group.by = "predicted_id", 
+        cols = mycols,
+        reduction = "umap") + NoAxes() + NoLegend() + ggtitle(NULL)
+
+DimPlot(object_list[["Patient_43"]], 
+        group.by = "predicted_id", 
+        cols = mycols,
+        reduction = "umap") + NoAxes() + NoLegend() + ggtitle(NULL)
+
+
+
+DimPlot(arg, 
+        group.by = "time", 
+        cols = mycols,
+        reduction = "umap") + NoAxes()
+DimPlot(arg, 
+        group.by = "predicted_id", 
+        cols = mycols,
+        reduction = "umap") + NoAxes()
+
+
+```
+
+# Survival analysis
+## Compositional shift using Atchison's distance
+```{r survival_analysis_composition_shift}
+
+patient_age <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                    object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/patient_age_at_dx.csv")
+
+comp_data <- dplyr::filter(cluster_summary) %>%
+  dplyr::select(-pct) %>%
+  dplyr::distinct() %>%
+  dplyr::select(patient, time, broad_cell_state, count, sex)
+
+comp_data_dx <- dplyr::filter(comp_data, time == "Dx") %>%
+  dplyr::select(-time)
+comp_data_re <- dplyr::filter(comp_data, time == "Re") %>%
+  dplyr::select(-time)
+
+# calculate atchison's distance between timepoints; if a particular cell type is absent from group, add 1 pseudocell to enable calculation
+pseudocount <- 10
+comp_df <- dplyr::full_join(comp_data_dx, comp_data_re, by = c("patient", "broad_cell_state", "sex"), suffix = c("_dx", "_re")) %>%
+  dplyr::mutate(count_dx = ifelse(is.na(count_dx), 0, count_dx) + pseudocount,
+                count_re = ifelse(is.na(count_re), 0, count_re) + pseudocount) %>%
+  dplyr::group_by(patient) %>%
+  dplyr::mutate(adist = as.numeric(vegan::vegdist(t(as.matrix(cbind(count_dx, count_re))), method = "aitchison"))) %>%
+  dplyr::ungroup() 
+
+surv_data <- dplyr::select(comp_df, patient, sex, adist) %>%
+  dplyr::distinct() %>%
+  dplyr::left_join(dplyr::select(cluster_summary, patient, patient_manuscript_id, time_dx_to_re, time_dx_to_last_follow_up, time_re_to_last_follow_up, vital_status, relapse_status) %>% distinct(), 
+                   by = "patient") %>%
+  dplyr::left_join(patient_age, by = "patient_manuscript_id") %>%
+  dplyr::mutate(vital_status = ifelse(vital_status == "Dead", 1, 0),
+                relapse_status = ifelse(relapse_status == "Relapsed", 1, 0),
+                adist_binary = ifelse(adist > mean(adist), "Hi", "Low"),
+                patient = as.character(patient),
+                sex = factor(sex, levels = c("male", "female")))
+
+clone_index <- mut_df %>%
+  dplyr::select(sample_id, SRSF2, NPM1, IDH1, ASXL1, FLT3, IDH2, KIT, NRAS, DNMT3A, TP53, TET2, SF3B1, RUNX1, WT1, STAG2, JAK2, CEBPA, shannon_index, simpson_index) %>%
+  dplyr::distinct() %>%
+  dplyr::filter(grepl("D$", sample_id)) %>%
+  dplyr::mutate(patient = gsub("-Diagnosis|-Relapse", "", sample_id),
+                patient = gsub("Patient-", "P", patient),
+                shannon_index_binary = ifelse(shannon_index > 0.1, "high", "low")) %>%
+  dplyr::select(-sample_id)
+
+surv_data <- surv_data %>%
+  dplyr::left_join(clone_index, by = "patient") %>%
+  as.data.frame() %>%
+  dplyr::mutate(ts = ifelse(TP53 > 1 | TET2 > 1 | WT1 > 1, "yes", "no"),
+                signaling = ifelse(FLT3 > 1 | KIT > 1, "yes", "no"),
+                epigenetic = ifelse(DNMT3A > 1 | IDH2 > 1, "yes", "no"))
+
+mysurv <- survival::Surv(time = surv_data$time_dx_to_last_follow_up, event = surv_data$vital_status)
+mysurv_re_to_event <- survival::Surv(time = surv_data$time_re_to_last_follow_up, event = surv_data$vital_status)
+mysurv_dx_to_re <- survival::Surv(time = surv_data$time_dx_to_re, event = surv_data$relapse_status)
+
+mycox <- coxph(mysurv ~ adist + sex + age_at_aml_dx, data = surv_data)
+summary(mycox)
+cox.zph(mycox)
+ggforest(model = mycox, data = surv_data)
+
+mycox <- coxph(mysurv_re_to_event ~ adist + sex + age_at_aml_dx, data = surv_data)
+summary(mycox)
+cox.zph(mycox)
+ggforest(model = mycox, data = surv_data)
+
+mycox <- coxph(mysurv ~ shannon_index + sex, data = surv_data)
+ggforest(model = mycox, data = surv_data)
+
+mycox <- coxph(mysurv ~ simpson_index + sex, data = surv_data)
+ggforest(model = mycox, data = surv_data)
+
+mycox <- coxph(mysurv ~ epigenetic + sex, data = surv_data)
+ggforest(model = mycox, data = surv_data)
+
+
+
+# generate kaplan-meier plot
+myfit <- survfit(mysurv ~ adist_binary, data = surv_data)
+myplot <- survminer::ggsurvplot(fit = myfit, 
+                                data = surv_data, 
+                                #surv.median.line = "h", 
+                                palette = "npg", 
+                                pval = TRUE, 
+                                pval.coord = c(3700, 1)) 
+myplot$plot <- myplot$plot +
+  xlab("Days after relapse") +
+  ylab("Overall survival") +
+  scale_x_continuous(breaks = c(0, 500, 1000, 1500, 2000, 5000)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+myplot
+
+# plot Aitchison's distnace
+ggbarplot(data = surv_data,
+          x = "patient_manuscript_id",
+          y = "adist",
+          xlab = "",
+          ylab = "Aitchison D",
+          fill = "gray",
+          color = "white",
+          width = 0.5) +
+    theme(axis.text.y = element_text(size = 15),
+        axis.title.y = element_text(size = 15))
+
+# plot Shannon index
+diversity_df <- mut_df %>%
+  dplyr::select(sample_id, shannon_index, simpson_index) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(time = ifelse(grepl("Diagnosis", sample_id), "D", "R"),
+                patient = gsub("Patient-", "P", sample_id),
+                patient = gsub("-Diagnosis|-Relapse", "", patient)) %>%
+  dplyr::select(-sample_id) %>%
+  dplyr::left_join(patient_id_map, by = "patient")
+
+ggbarplot(data = diversity_df,
+          x = "time",
+          y = "shannon_index",
+          xlab = "",
+          ylab = "Shannon index",
+          fill = "time",
+          palette = c("gray", "gray"),
+          color = "white",
+          width = 0.7) +
+  facet_grid(~patient_manuscript_id) +
+  theme(axis.text.y = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        strip.text = element_blank())
+
+```
+
+# Compare compositional shift with clonal stability
+```{r mut_vs_comp, eval = FALSE}
+
+mutation_shift <- sample_mut[, !grepl("-65-|-60-", colnames(sample_mut_cat))]
+mutation_shift_dx <- mutation_shift[, grepl("Diagnosis", colnames(mutation_shift))]
+mutation_shift_re <- mutation_shift[, grepl("Relapse", colnames(mutation_shift))]
+stopifnot(all(gsub("-Diagnosis", "", colnames(mutation_shift_dx)) == gsub("-Relapse", "", colnames(mutation_shift_re))))
+
+mutation_ed <- NULL
+mypats <- gsub("-Diagnosis", "", colnames(mutation_shift_dx))
+for (pat in mypats) {
+
+  x <- mutation_shift_dx[, grepl(paste0(pat, "-"), colnames(mutation_shift_dx))]
+  y <- mutation_shift_re[, grepl(paste0(pat, "-"), colnames(mutation_shift_re))]
+  num_change <- ifelse(all(x == y), "stable", "unstable")
+  mutation_ed[[pat]] <- data.frame(patient = gsub("Patient-", "P", pat), mutation_distance = num_change)
+  
+}
+mutation_ed <- do.call("rbind", mutation_ed)
+
+surv_data_mut <- dplyr::inner_join(surv_data, mutation_ed, by = c("patient")) %>%
+  dplyr::mutate(chr_stability = ifelse(patient %in% c("P61", "P29", "P30", "P50", "P28", "P49", "P52", "P43"), "unstable", "stable")) %>%
+  dplyr::mutate(overall_stability = ifelse(mutation_distance == "stable" & chr_stability == "stable", "stable", "unstable"))
+
+ggscatter(data = surv_data_mut,
+          x = "adist",
+          y = "mutation_distance",
+          label = "patient",
+          cor.coef = TRUE)
+
+ggboxplot(data = surv_data_mut,
+          x = "mutation_distance",
+          y = "adist",
+          label = "patient") +
+  stat_compare_means()
+
+ggboxplot(data = surv_data_mut,
+          x = "mutation_distance",
+          y = "adist",
+          add = "jitter") +
+  stat_compare_means(method.args = list(alternative = "less"))
+
+
+
+
+
+
+mutation_shift <- sample_mut[, !grepl("-65-|-60-", colnames(sample_mut))]
+mutation_shift_dx <- mutation_shift[, grepl("Diagnosis", colnames(mutation_shift))]
+mutation_shift_re <- mutation_shift[, grepl("Relapse", colnames(mutation_shift))]
+stopifnot(all(gsub("-Diagnosis", "", colnames(mutation_shift_dx)) == gsub("-Relapse", "", colnames(mutation_shift_re))))
+
+mutation_ed <- NULL
+mypats <- gsub("-Diagnosis", "", colnames(mutation_shift_dx))
+for (pat in mypats) {
+
+  x <- mutation_shift_dx[, grepl(paste0(pat, "-"), colnames(mutation_shift_dx))]
+  y <- mutation_shift_re[, grepl(paste0(pat, "-"), colnames(mutation_shift_re))]
+  ed <- 1 - cor(x, y, method = "pearson")
+  mutation_ed[[pat]] <- data.frame(patient = gsub("Patient-", "P", pat), mutation_distance = ed)
+  
+}
+mutation_ed <- do.call("rbind", mutation_ed)
+
+surv_data_mut <- dplyr::inner_join(surv_data, mutation_ed, by = c("patient")) %>%
+  dplyr::mutate(chr_stability = ifelse(patient %in% c("P61", "P29", "P30", "P50", "P28", "P49", "P52", "P43"), "unstable", "stable")) %>%
+  dplyr::mutate(hsct = ifelse(patient %in% c("P26", "P27", "P29", "P30", "P28", "P4", "P31"), "yes", "no")) %>%
+  dplyr::slice(match(gsub("atient-|-Diagnosis|-Relapse", "", myorder), patient))
+
+ggscatter(data = surv_data_mut,
+          x = "adist",
+          y = "mutation_distance",
+          xlab = "Aitchison distance",
+          ylab = "Pearson distance",
+          label = "patient",
+          color = "hsct",
+          repel = TRUE,
+          cor.coef = TRUE,
+          #facet.by = "hsct",
+          size = 2) +
+  geom_smooth(method = "lm", lty = 2, lwd = 0.45)
+
+bardata <- data.frame(patient = surv_data_mut$patient, value = surv_data_mut$adist, distance = "Aitchison distance")
+bardata <- rbind(bardata, data.frame(patient = surv_data_mut$patient, value = surv_data_mut$mutation_distance, distance = "Pearson distance"))
+bardata <- dplyr::mutate(bardata, patient = factor(patient, levels = patient_order))
+
+ggplot(dplyr::filter(bardata, distance == "Aitchison distance"), aes(x = patient, y = value, fill = distance)) + 
+  geom_bar(stat = "identity", width = 0.5, fill = "azure4") +
+  xlab("") +
+  ylab("Aitchison D") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+ggplot(dplyr::filter(bardata, distance == "Pearson distance"), aes(x = patient, y = value, fill = distance)) + 
+  geom_bar(stat = "identity", position = "identity", width = 0.45) +
+  theme_linedraw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) 
+
+```
+
+
+## Broad cell states
+```{r broad_cell_states}
+
+surv_data_ref <- comp_data %>%
+  janitor::clean_names() %>%
+  dplyr::group_by(patient, sex, time) %>%
+  dplyr::mutate(percent = count / sum(count) * 100) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-count) %>%
+  tidyr::pivot_wider(values_from = percent, names_from = time, values_fill = 0) %>%
+  dplyr::mutate(blast_cell_state_l2 = case_when(blast_cell_state %in% c("HSC", "MEP", "GMP") ~ "HSPC",
+                                                grepl("T$", blast_cell_state) ~ "T cell",
+                                                blast_cell_state %in% c("preB", "B cell") ~ "B cell",
+                                                blast_cell_state %in% c("Monocyte", "DC") ~ "Differentiated myeloid"))
+
+surv_data <- surv_data_ref %>%
+  dplyr::select(-blast_cell_state) %>%
+  dplyr::group_by(patient, sex, blast_cell_state_l2) %>%
+  dplyr::summarize(Dx = sum(Dx), Re = sum(Re)) %>%
+  dplyr::ungroup()
+
+surv_data <- surv_data %>%
+  dplyr::mutate(percent_change_from_dx = Dx - Re) %>%
+  dplyr::left_join(dplyr::select(cluster_summary, patient, time_dx_to_last_follow_up, time_dx_to_re, vital_status) %>% distinct(), by = "patient") %>%
+  dplyr::mutate(vital_status = ifelse(vital_status == "Dead", 1, 0)) %>%
+  as.data.frame() 
+
+# HSPC
+tmp_surv_data <- dplyr::filter(surv_data, blast_cell_state_l2 %in% c("HSPC"))
+mysurv <- survival::Surv(time = tmp_surv_data$time_dx_to_last_follow_up, event = tmp_surv_data$vital_status)
+mycox <- coxph(mysurv ~ Dx + Re + sex, data = tmp_surv_data)
+summary(mycox)
+ggforest(mycox)
+
+# T cell
+tmp_surv_data <- dplyr::filter(surv_data, blast_cell_state_l2 %in% c("T cell"))
+mysurv <- survival::Surv(time = tmp_surv_data$time_dx_to_last_follow_up, event = tmp_surv_data$vital_status)
+mycox <- coxph(mysurv ~ Dx + Re + sex, data = tmp_surv_data)
+summary(mycox)
+ggforest(mycox)
+
+# B cell
+tmp_surv_data <- dplyr::filter(surv_data, blast_cell_state_l2 %in% c("B cell"))
+mysurv <- survival::Surv(time = tmp_surv_data$time_dx_to_last_follow_up, event = tmp_surv_data$vital_status)
+mycox <- coxph(mysurv ~ Dx + Re + sex, data = tmp_surv_data)
+summary(mycox)
+ggforest(mycox)
+
+# Differentiated myeloid
+tmp_surv_data <- dplyr::filter(surv_data, blast_cell_state_l2 %in% c("Differentiated myeloid"))
+mysurv <- survival::Surv(time = tmp_surv_data$time_dx_to_last_follow_up, event = tmp_surv_data$vital_status)
+mycox <- coxph(mysurv ~ Dx + Re + sex, data = tmp_surv_data)
+summary(mycox)
+ggforest(mycox)
+
+```
+
+## Specific cell states
+```{r specific_cell_states}
+
+surv_data <- surv_data_ref %>%
+  dplyr::select(-blast_cell_state_l2) %>%
+  dplyr::group_by(patient, sex, blast_cell_state) %>%
+  dplyr::summarize(Dx = sum(Dx), Re = sum(Re)) %>%
+  dplyr::ungroup()
+
+surv_data <- surv_data %>%
+  dplyr::mutate(percent_change_from_dx = Dx - Re) %>%
+  dplyr::left_join(dplyr::select(cluster_summary, patient, time_dx_to_last_follow_up, time_dx_to_re, vital_status) %>% distinct(), by = "patient") %>%
+  dplyr::mutate(vital_status = ifelse(vital_status == "Dead", 1, 0)) %>%
+  as.data.frame() 
+
+# CD4+ naive T
+tmp_surv_data <- dplyr::filter(surv_data, blast_cell_state %in% c("CD4+ naive T"))
+mysurv <- survival::Surv(time = tmp_surv_data$time_dx_to_last_follow_up, event = tmp_surv_data$vital_status)
+mycox <- coxph(mysurv ~ Dx + Re + sex, data = tmp_surv_data)
+summary(mycox)
+
+# CD4+ memory T
+tmp_surv_data <- dplyr::filter(surv_data, blast_cell_state %in% c("CD4+ memory T"))
+mysurv <- survival::Surv(time = tmp_surv_data$time_dx_to_last_follow_up, event = tmp_surv_data$vital_status)
+mycox <- coxph(mysurv ~ Dx + Re + sex, data = tmp_surv_data)
+summary(mycox)
+ggforest(mycox)
+
+# CD8+ naive T 
+tmp_surv_data <- dplyr::filter(surv_data, blast_cell_state %in% c("CD8+ naive T"))
+mysurv <- survival::Surv(time = tmp_surv_data$time_dx_to_last_follow_up, event = tmp_surv_data$vital_status)
+mycox <- coxph(mysurv ~ Dx + Re + sex, data = tmp_surv_data)
+summary(mycox)
+ggforest(mycox)
+
+# CD8+ memory T
+tmp_surv_data <- dplyr::filter(surv_data, blast_cell_state %in% c("CD8+ memory T"))
+mysurv <- survival::Surv(time = tmp_surv_data$time_dx_to_last_follow_up, event = tmp_surv_data$vital_status)
+mycox <- coxph(mysurv ~ Dx + Re + sex, data = tmp_surv_data)
+summary(mycox)
+
+```
+
+# Cluster all modalities together
+```{r cluster_all_modalities}
+
+clust_data <- sample_mut
+tmp <- comp_data %>% 
+  dplyr::select(patient, time, broad_cell_state, count) %>%
+  dplyr::mutate(patient = gsub("P", "Patient-", patient),
+                time = ifelse(time == "Dx", "Diagnosis", "Relapse")) %>%
+  tidyr::unite(sample_id, patient, time, sep = "-") %>%
+  tidyr::pivot_wider(names_from = sample_id, values_from = count, values_fill = 0) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("broad_cell_state")
+tmp <- tmp[, colnames(clust_data)]
+
+tmp2 <- do.call("rbind", heatdata_list)
+tmp2[is.na(tmp2)] <- 0
+tmp2 <- t(tmp2)
+tmp2 <- tmp2[, colnames(clust_data)]
+rownames(tmp2) <- paste0("ag-", rownames(tmp2))
+clust_data <- rbind(clust_data, tmp)
+clust_data <- rbind(clust_data, tmp2)
+
+clust_data <- scale(t(clust_data))
+pheatmap(cor(t(clust_data), use = "pairwise.complete.obs"))
+
+```
+
+# Pseudobulk differential expression analysis and enrichment between relapse and relapse groups
+## Load gene sets from MSigDB
+```{r gene_sets}
+
+all_gene_sets = msigdbr(species = "Homo sapiens") %>%
+  dplyr::filter(gs_cat %in% "H")
+
+pgs_list <- all_gene_sets %>%
+  dplyr::group_by(gs_name) %>%
+  dplyr::group_split()
+
+list_names <- lapply(pgs_list, function(arg) unique(arg$gs_name)) %>% unlist()
+pgs_list <- lapply(pgs_list, function(arg) arg$human_gene_symbol)
+names(pgs_list) <- gsub("HALLMARK_|GOBP_", "", list_names)
+
+
+all_gene_sets = msigdbr(species = "Homo sapiens") %>%
+  dplyr::filter(gs_cat %in% "C1")
+
+pos_gs_list <- all_gene_sets %>%
+  dplyr::group_by(gs_name) %>%
+  dplyr::group_split()
+
+list_names <- lapply(pos_gs_list, function(arg) unique(arg$gs_name)) %>% unlist()
+pos_gs_list <- lapply(pos_gs_list, function(arg) arg$human_gene_symbol)
+names(pos_gs_list) <- list_names
+
+all_gene_sets <- msigdbr(species = "Homo sapiens") %>%
+  dplyr::filter(gs_cat %in% "C7", 
+                gs_subcat %in% "IMMUNESIGDB", 
+                grepl("IL1|IL6|IL8|IL12|IFNG|TNFA", gs_description) | grepl("GSE5099_CLASSICAL_M1_VS_ALTERNATIVE_M2_MACROPHAGE", gs_name),
+                !grepl("MICROGLIA", gs_description))
+
+immune_gs_list <- all_gene_sets %>%
+  dplyr::group_by(gs_name) %>%
+  dplyr::group_split()
+
+list_names <- lapply(immune_gs_list, function(arg) unique(arg$gs_name)) %>% unlist()
+immune_gs_list <- lapply(immune_gs_list, function(arg) arg$human_gene_symbol)
+names(immune_gs_list) <- list_names
+
+
+
+# senmayo <- msigdbr(species = "Homo sapiens") %>%
+#   dplyr::filter(gs_cat %in% "C2", gs_subcat %in% "CGP")
+#   dplyr::filter(gs_name == "SAUL_SEN_MAYO")
+# 
+#   
+# senmayo <- list(senmayo = c("ACVR1B","ANG","ANGPT1","ANGPTL4","AREG","AXL","BEX3","BMP2","BMP6","C3","CCL1","CCL13","CCL16","CCL2","CCL20","CCL24","CCL26","CCL3","","CCL4","CCL5","CCL7","CCL8","CD55","CD9","CSF1","CSF2","CSF2RB","CST4","CTNNB1","CTSB","CXCL1","CXCL10","CXCL12","CXCL16","CXCL2","CXCL3","CXCL8","CXCR2","DKK1","EDN1","EGF","EGFR","EREG","ESM1","ETS2","FAS","FGF1","FGF2","FGF7","GDF15","GEM","GMFG","HGF","HMGB1","ICAM1","ICAM3","IGF1","IGFBP1","IGFBP2","IGFBP3","IGFBP4","IGFBP5","IGFBP6","IGFBP7","IL10","IL13","IL15","IL18","IL1A","IL1B","IL2","IL32","IL6","IL6ST","IL7","INHA","IQGAP2","ITGA2","ITPKA","JUN","KITLG","LCP1","MIF","MMP1","MMP10","MMP12","MMP13","MMP14","MMP2","MMP3","MMP9","NAP1L4","NRG1","PAPPA","PECAM1","PGF","PIGF","PLAT","PLAU","PLAUR","PTBP1","PTGER2","PTGES","RPS6KA5","SCAMP4","SELPLG","SEMA3F","SERPINB4","SERPINE1","SERPINE2","SPP1","SPX","TIMP2","TNF","TNFRSF10C","TNFRSF11B","TNFRSF1A","TNFRSF1B","TUBGCP2","VEGFA","VEGFC","VGF","WNT16","WNT2"))
+
+```
+
+## All blasts
+```{r blasts_whole}
+
+pseudobulk <- edgeR::Seurat2PB(dplyr::filter(blast_object, cell_state_harmony_rna != "Unknown"), cluster = "time", sample = "sample_id")
+pseudobulk$samples$patient <- gsub("_relapse|_Relapse", "", pseudobulk$samples$sample)
+keep.genes <- filterByExpr(pseudobulk, min.count = 10, min.total.count = 100)
+pseudobulk <- pseudobulk[keep.genes, , keep = FALSE]
+pseudobulk <- normLibSizes(pseudobulk)
+
+cluster <- as.factor(pseudobulk$samples$cluster)
+patient <- as.factor(pseudobulk$samples$patient)
+
+design <- model.matrix(~ 0 + cluster + patient)
+con <- makeContrasts(clusterRelapse - clusterrelapse, levels = design)
+pseudobulk <- estimateDisp(pseudobulk, design, robust = TRUE)
+fit <- glmQLFit(pseudobulk, design, robust = TRUE)
+qlf <- glmQLFTest(fit, contrast = con)
+
+top_table_edger <- qlf$table %>%
+  dplyr::mutate(padj = p.adjust(PValue, method = "BH")) %>%
+  dplyr::arrange(PValue)
+
+EnhancedVolcano(top_table_edger,
+                lab = top_table_edger %>% rownames,
+                x = 'logFC',
+                y = 'PValue',
+                FCcutoff = 0.5,
+                pCutoff = 0.05)
+
+
+mystats <- top_table_edger$logFC
+names(mystats) <- rownames(top_table_edger)
+mystats <- mystats[is.finite(mystats)]
+es_res <- fgsea(pathways = pgs_list, stats = mystats, nPermSimple = 10000) %>%
+  dplyr::arrange(pval)
+
+es_res
+
+
+```
+
+
+## Blasts subset on different cell states
+```{r de_and_enrichment}
+
+
+pseudobulk <- AggregateExpression(dplyr::filter(blast_object, predicted_id %in% c("HSC", "GMP", "MEP", "Monocyte", "cDC", "preB")), 
+                                  features = rownames(blast_object@assays$RNA), 
+                                  assays = "RNA", 
+                                  return.seurat = TRUE, 
+                                  group.by = c("sample_manuscript_id", "predicted_id"))
+
+pseudobulk <- pseudobulk %>%
+  dplyr::mutate(time = substr(sample_manuscript_id, 4, 4),
+                patient = substr(sample_manuscript_id, 1, 3))
+                                  
+pseudobulk <- SplitObject(pseudobulk, split.by = "predicted_id")
+
+# remove lowly expressed genes - features must have at least 10 counts in at last 50% of samples
+pseudobulk_filt <- NULL
+for(tmp_object in pseudobulk) {
+  
+  features <- rownames(tmp_object@assays$RNA)[rowSums(tmp_object@assays$RNA@layers$counts > 10) > (0.5 * ncol(tmp_object))]
+  if (length(features) < 10) {
+    next
+  } else {
+    tmp_object <- subset(tmp_object, features = features)
+    stopifnot(nrow(tmp_object) == length(features))
+    pseudobulk_filt[[unique(tmp_object$predicted_id)]] <- tmp_object
+  }
+  
+}
+
+limma_res <- NULL
+for (tmp_object in pseudobulk_filt) {
+
+   # paired analysis requires addition of patient ID to model formula
+   # there are some patients where a cell state is in one time point but not the other
+   design_matrix <- model.matrix(~time + patient, data = tmp_object@meta.data)
+
+   v <- limma::voom(counts = as.matrix(LayerData(tmp_object, layer = "count", assay = "RNA")),
+                    design = design_matrix,
+                    plot = TRUE,
+                    normalize = "quantile")
+    
+   fit <- limma::lmFit(v, design = design_matrix)
+   fit <- limma::eBayes(fit)
+   top_table <- limma::topTable(fit, number = Inf, coef = "timeR", sort.by = "P")
+   top_table <- dplyr::mutate(top_table, blast_lineage = unique(tmp_object$predicted_id))
+
+  limma_res[[unique(tmp_object$predicted_id)]] <- top_table
+
+}
+
+```
+
+## T cells
+```{r de_and_enrichment_tcells}
+
+tcell_object <- dplyr::filter(aml_data, 
+                              cell_state_harmony_rna %in% c("CD8 T cell"))
+                                
+pseudobulk <- edgeR::Seurat2PB(tcell_object, cluster = "time", sample = "sample_id")
+pseudobulk$samples$patient <- gsub("_relapse|_Relapse", "", pseudobulk$samples$sample)
+keep.genes <- filterByExpr(pseudobulk, min.count = 10, min.total.count = 100)
+pseudobulk <- pseudobulk[keep.genes, , keep = FALSE]
+pseudobulk <- normLibSizes(pseudobulk)
+
+cluster <- as.factor(pseudobulk$samples$cluster)
+patient <- as.factor(pseudobulk$samples$patient)
+
+design <- model.matrix(~ 0 + cluster + patient)
+con <- makeContrasts(clusterRelapse - clusterrelapse, levels = design)
+pseudobulk <- estimateDisp(pseudobulk, design, robust = TRUE)
+fit <- glmQLFit(pseudobulk, design, robust = TRUE)
+qlf <- glmQLFTest(fit, contrast = con)
+
+top_table_edger <- qlf$table %>%
+  dplyr::mutate(padj = p.adjust(PValue, method = "BH")) %>%
+  dplyr::arrange(PValue)
+
+EnhancedVolcano(top_table_edger,
+                lab = top_table_edger %>% rownames,
+                x = 'logFC',
+                y = 'PValue',
+                FCcutoff = 0.5,
+                pCutoff = 0.05)
+
+
+mystats <- top_table_edger$logFC
+names(mystats) <- rownames(top_table_edger)
+mystats <- mystats[is.finite(mystats)]
+es_res <- fgsea(pathways = pgs_list, stats = mystats, nPermSimple = 10000) %>%
+  dplyr::arrange(pval)
+
+es_res
+
+
+```
+
+# GSVA on sample peudobulk profiles
+## Blasts
+```{r ssgsea_blast_pseudobulk}
+
+pseudobulk <- AggregateExpression(dplyr::filter(blast_object, !grepl("T$|NK|B cell|Erythroid|Unknown", predicted_id)), 
+                                  assays = c("RNA"), 
+                                  group.by = c("sample_manuscript_id", "predicted_id"))
+
+pseudobulk_rna <- pseudobulk$RNA
+
+myparam <- GSVA::gsvaParam(exprData = pseudobulk_rna, 
+                           geneSets = pgs_list, 
+                           kcdf = "Poisson", 
+                           minSize = 5, 
+                           sparse = TRUE)
+
+hallmark_es <- GSVA::gsva(myparam)
+
+# pathways_to_include <- c("INFLAMMATORY_RESPONSE",
+#                          "TNFA_SIGNALING_VIA_NFKB",
+#                          "INTERFERON_ALPHA_RESPONSE",
+#                          "IL6_JAK_STAT3_SIGNALING",
+#                          #"INTERFERON_GAMMA_REPONSE",
+#                          "IL2_STAT5_SIGNALING",
+#                          "COMPLEMENT",
+#                          "ALLOGRAFT_REJECTION",
+#                          "E2F_TARGETS",
+#                          "MYC_TARGETS_V1",
+#                          "MYC_TARGETS_V2",
+#                          "G2M_CHECKPOINT",
+#                          "OXIDATIVE_PHOSPHORYLATION",
+#                          "MYC_TARGETS_V2",
+#                          "DNA_REPAIR")
+# 
+# hallmark_es_filt <- hallmark_es_filt[pathways_to_include, ]
+hallmark_es_relapse <- hallmark_es[, grepl("D_", colnames(hallmark_es))]
+hallmark_es_relapse <- hallmark_es[, grepl("R_", colnames(hallmark_es))]
+
+pheatmap(hallmark_es_relapse)
+pheatmap(hallmark_es_relapse)
+pheatmap(hallmark_es)
+
+# relapse
+patient <- gsub("D_.*", "", colnames(hallmark_es_relapse))
+cell_state <- gsub(".*_", "", colnames(hallmark_es_relapse))
+
+patient_colors <- pals::glasbey()
+names(patient_colors) <- unique(aml_data$patient_manuscript_id)
+patient_colors <- patient_colors[!is.na(names(patient_colors))]
+
+lineage_colors <- c("firebrick1", "lightcyan3", "seagreen3", "cyan", "purple", "hotpink", "gold1", "mediumturquoise", "yellow2", "sienna3", "springgreen", "olivedrab", "orange1",  "cornflowerblue", "rosybrown1", "maroon2", "slateblue2", "tan2")
+names(lineage_colors) <- levels(aml_data$predicted_id)
+lineage_colors <- lineage_colors[names(lineage_colors) %in% cell_state]
+ha <- HeatmapAnnotation(
+    "Patient" = patient,
+    "Lineage state" = factor(cell_state, levels = unique(cell_state)),
+    col = list(`Patient` = patient_colors, `Lineage state` = lineage_colors),
+    na_col = "lightgray",
+    annotation_name_side = "left"
+)
+
+hallmark_es_relapse <- hallmark_es_relapse[order(rowMeans(hallmark_es_relapse), decreasing = TRUE), ]
+mysplit <- kmeans(hallmark_es_relapse, 3)$cluster
+
+myheatmap <- ComplexHeatmap::Heatmap(
+  hallmark_es_relapse,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  clustering_method_rows = "ward.D2", 
+  clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  #row_split = mysplit,
+  column_split = patient,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(1.5, "mm"),
+  row_gap = unit(1.5, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(hallmark_es), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+
+# relapse
+patient <- gsub("R_.*", "", colnames(hallmark_es_relapse))
+cell_state <- gsub(".*_", "", colnames(hallmark_es_relapse))
+
+ha <- HeatmapAnnotation(
+    "Patient" = patient,
+    "Lineage state" = factor(cell_state, levels = unique(cell_state)),
+    col = list(`Patient` = patient_colors, `Lineage state` = lineage_colors),
+    na_col = "lightgray",
+    annotation_name_side = "left"
+)
+
+hallmark_es_relapse <- hallmark_es_relapse[order(rowMeans(hallmark_es_relapse), decreasing = TRUE), ]
+#mysplit <- kmeans(hallmark_es_relapse, 3)$cluster
+
+myheatmap <- ComplexHeatmap::Heatmap(
+  hallmark_es_relapse,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  clustering_method_rows = "ward.D2", 
+  clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  #row_split = mysplit,
+  column_split = patient,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(1.5, "mm"),
+  row_gap = unit(1.5, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(hallmark_es), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+```
+
+## Blasts small molecule drug signatures
+```{r ssgsea_blast_pseudobulk_small_molecule_signatures}
+
+pseudobulk <- AggregateExpression(dplyr::filter(blast_object, !grepl("T$|NK|B cell|Erythroid|Unknown", predicted_id)), 
+                                  assays = c("RNA"), 
+                                  group.by = c("sample_manuscript_id", "predicted_id"))
+
+pseudobulk_rna <- pseudobulk$RNA
+
+pseudobulk_adt <- AggregateExpression(dplyr::filter(blast_object, !grepl("T$|NK|B cell|Erythroid|Unknown", predicted_id)), 
+                                      assays = c("ADT"), 
+                                      group.by = c("sample_manuscript_id", "predicted_id"),
+                                      return.seurat = TRUE)
+
+pseudobulk_adt <- NormalizeData(pseudobulk_adt$ADT, normalization.method = "CLR", margin = 2)
+pseudobulk_adt <- FetchData(pseudobulk_adt, vars = c("CD33", "CLL1", "CD305", "CD49D", "CD205", "CD244"), assay = "ADT", layer = "data")
+pseudobulk_adt <- t(pseudobulk_adt)
+pseudobulk_adt_relapse <- pseudobulk_adt[, grepl("D_", colnames(pseudobulk_adt))]
+pseudobulk_adt_relapse <- pseudobulk_adt[, grepl("R_", colnames(pseudobulk_adt))]
+
+# Run GSVA on RNA pseudobulk using MERGE drug signatures
+drug_sigs <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                  col_names = FALSE,
+                                  object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/gene_signatures/drug_signatures.csv")
+
+drug_sigs <- drug_sigs %>%
+  dplyr::group_split(X2)
+drug_sigs_names <- lapply(drug_sigs, function(arg) unique(dplyr::pull(arg, X2)))
+drug_sigs <- lapply(drug_sigs, function(arg) dplyr::pull(arg, X1))
+names(drug_sigs) <- drug_sigs_names
+                  
+myparam <- GSVA::gsvaParam(exprData = pseudobulk_rna, 
+                           geneSets = drug_sigs, 
+                           kcdf = "Poisson", 
+                           minSize = 5, 
+                           sparse = TRUE)
+
+hallmark_es <- GSVA::gsva(myparam)
+hallmark_es_relapse <- hallmark_es[, grepl("D_", colnames(hallmark_es))]
+hallmark_es_relapse <- hallmark_es[, grepl("R_", colnames(hallmark_es))]
+
+# all samples
+patient <- gsub("D_.*|R_.*", "", colnames(hallmark_es))
+cell_state <- gsub(".*_", "", colnames(hallmark_es))
+timepoint <- unlist(lapply(colnames(hallmark_es), function(arg) substr(arg, 4, 4)))
+
+ha <- HeatmapAnnotation(
+  "Patient" = patient,
+  "Time" = timepoint,
+  "Lineage state" = cell_state,
+    na_col = "lightgray",
+    annotation_name_side = "left"
+)
+
+#mysplit <- kmeans(hallmark_es_relapse, 3)$cluster
+
+myheatmap <- ComplexHeatmap::Heatmap(
+  hallmark_es,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  clustering_method_rows = "ward.D2", 
+  clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  #row_split = mysplit,
+  column_split = patient,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(1.5, "mm"),
+  row_gap = unit(1.5, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(hallmark_es), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+# relapse
+patient <- gsub("D_.*|R_.*", "", colnames(hallmark_es_relapse))
+cell_state <- gsub(".*_", "", colnames(hallmark_es_relapse))
+
+patient_colors <- pals::glasbey()
+names(patient_colors) <- unique(aml_data$patient_manuscript_id)
+patient_colors <- patient_colors[!is.na(names(patient_colors))]
+
+lineage_colors <- c("firebrick1", "lightcyan3", "seagreen3", "cyan", "purple", "hotpink", "gold1", "mediumturquoise", "yellow2", "sienna3", "springgreen", "olivedrab", "orange1",  "cornflowerblue", "rosybrown1", "maroon2", "slateblue2", "tan2")
+names(lineage_colors) <- levels(aml_data$predicted_id)
+lineage_colors <- lineage_colors[names(lineage_colors) %in% cell_state]
+ha <- HeatmapAnnotation(
+    "Patient" = patient,
+    "Lineage state" = factor(cell_state, levels = unique(cell_state)),
+    col = list(`Patient` = patient_colors, `Lineage state` = lineage_colors),
+    na_col = "lightgray",
+    annotation_name_side = "left"
+)
+set.seed(4602)
+mysplit <- kmeans(hallmark_es_relapse, 3)$cluster
+myheatmap <- ComplexHeatmap::Heatmap(
+  hallmark_es_relapse,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  clustering_method_rows = "ward.D2", 
+  clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  row_split = mysplit,
+  column_split = patient,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(1, "mm"),
+  row_gap = unit(1, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(hallmark_es), 
+    gp = gpar(fontsize = 12)
+  )
+)
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+
+pseudobulk_adt_relapse <- pseudobulk_adt[, grepl("D_", colnames(pseudobulk_adt))]
+ag_heatmap <- ComplexHeatmap::Heatmap(
+  pseudobulk_adt_relapse,
+  col = c("blue", "white", "yellow"),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  column_split = patient,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(1, "mm"),
+  row_gap = unit(1, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(hallmark_es), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+draw(ag_heatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+
+
+# relapse
+patient <- gsub("D_.*|R_.*", "", colnames(hallmark_es_relapse))
+cell_state <- gsub(".*_", "", colnames(hallmark_es_relapse))
+
+ha <- HeatmapAnnotation(
+    "Patient" = patient,
+    "Lineage state" = factor(cell_state, levels = unique(cell_state)),
+    col = list(`Patient` = patient_colors, `Lineage state` = lineage_colors),
+    na_col = "lightgray",
+    annotation_name_side = "left"
+)
+
+mysplit <- kmeans(hallmark_es_relapse, 3)$cluster
+
+set.seed(4602)
+myheatmap <- ComplexHeatmap::Heatmap(
+  hallmark_es_relapse,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  row_split = mysplit,
+  column_split = patient,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(1., "mm"),
+  row_gap = unit(1, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(hallmark_es), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+pseudobulk_adt_relapse <- pseudobulk_adt[, grepl("R_", colnames(pseudobulk_adt))]
+ag_heatmap <- ComplexHeatmap::Heatmap(
+  pseudobulk_adt_relapse,
+  col = c("blue", "white", "yellow"),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  column_split = patient,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(1, "mm"),
+  row_gap = unit(1, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(hallmark_es), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+draw(ag_heatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+
+```
+
+
+## Microenvironment
+```{r microenvironment}
+
+me_aml <- dplyr::filter(aml_data, grepl("T$|B cell", predicted_id))
+
+pseudobulk <- AggregateExpression(me_aml,
+                                  assays = c("RNA"), 
+                                  group.by = c("sample_id", "predicted_id"))
+
+pseudobulk_rna <- pseudobulk$RNA
+
+myparam <- GSVA::gsvaParam(exprData = pseudobulk_rna, 
+                           geneSets = pgs_list, 
+                           kcdf = "Poisson", 
+                           minSize = 5, 
+                           sparse = TRUE)
+
+hallmark_es_me <- GSVA::gsva(myparam)
+hallmark_es_me <- hallmark_es_me %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("pb_id") %>%
+  tidyr::separate(col = pb_id, into = c("sample_id", "cell_state"), sep = "_", remove = FALSE) %>%
+  dplyr::mutate(time = ifelse(grepl("Diagnosis", sample_id), "Diagnosis", "Relapse"),
+                patient = gsub("-Diagnosis|-Relapse", "", sample_id)) %>%
+  dplyr::arrange(cell_state, time, patient) %>%
+  dplyr::select(-sample_id, -cell_state, -time, -patient) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("pb_id") %>%
+  t() %>%
+  as.data.frame()
+
+
+
+# all samples
+patient <- gsub("_.*", "", colnames(hallmark_es_me))
+cell_state <- gsub(".*_", "", colnames(hallmark_es_me))
+timepoint <- gsub(".*-|_.*", "", colnames(hallmark_es_me))
+cell_state_timepoint <- paste(cell_state, timepoint, sep = "_")
+
+hsct_samples <- unique(aml_data$sample_id[aml_data$hsct == "HSCT"])
+hsct_samples <- gsub("_", "-", hsct_samples)
+hsct <- ifelse(gsub("_.*", "", colnames(hallmark_es_me)) %in% hsct_samples, "hsct", "none")
+
+ha <- HeatmapAnnotation(
+  "Lineage state" = cell_state,
+  "Time" = timepoint,
+  "Patient" = patient,
+  "HSCT" = hsct,
+    # col = list(`Response to chemotherapy` = c("Complete response" = "plum1", "Partial response" = "brown", "No response" = "darkorange"),
+    #            `Initial treatment` = c("3+7" = "aquamarine4", "Other" = "olivedrab2"), 
+    #            HSCT = c("HSCT" = "hotpink", "none" = "bisque")
+    #        ),
+    na_col = "lightgray",
+    annotation_name_side = "left"
+)
+
+#mysplit <- kmeans(hallmark_es_me_relapse, 3)$cluster
+
+hallmark_es_me_filt <- hallmark_es_me[order(apply(hallmark_es_me, 1, sd), decreasing = TRUE), ]
+hallmark_es_me_filt <- hallmark_es_me_filt[1:25, ]
+myheatmap <- ComplexHeatmap::Heatmap(
+  hallmark_es_me_filt,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  clustering_method_rows = "ward.D2", 
+  clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  #row_split = mysplit,
+  column_split = cell_state,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(1.5, "mm"),
+  row_gap = unit(1.5, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(hallmark_es_me), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+```
+
+
+
+# Single cell DE analysis across timepoints
+```{r de_and_enrichment}
+
+# blast_split <- SplitObject(dplyr::filter(blast_object, !predicted_id %in% "Unknown"), split.by = "predicted_id")  
+# blast_split <- lapply(blast_split, function(arg) {
+#   arg <- SplitObject(arg, split.by = "patient")
+#   return(arg)
+# })
+
+scde <- list()
+for (cell_state in unique(blast_object$predicted_id)) {
+  cell_state <- dplyr::filter(blast_object, predicted_id %in% cell_state)
+  for (pat in unique(cell_state$patient_manuscript_id)) {
+    pat <- dplyr::filter(cell_state, patient_manuscript_id %in% pat)
+    
+    if (ncol(pat) < 50) next
+    set.seed(52949)
+    # cell_sample <- sample(colnames(pat), min(ncol(pat), 2000))
+    # pat <- subset(x = pat, cells = cell_sample)
+    pat <- CreateSeuratObject(counts = as(LayerData(pat, layer = "counts", assay = "RNA"), "dgCMatrix"), meta.data = pat@meta.data)
+    pat <- NormalizeData(pat)
+    
+    Idents(pat) <- "time"
+    
+    if (min(table(pat$time)) < 10 | length(unique(pat$time)) < 2) next
+    
+    top_table <- FindMarkers(pat, 
+                             test.use = "wilcox", 
+                             #latent.vars = c("percent.mt"),
+                             ident.1 = "Relapse",
+                             ident.2 = "Diagnosis",
+                             random.seed = 56739, 
+                             max.cells.per.ident = min(table(pat$time)),
+                             logfc.threshold = log2(1.20),
+                             min.cells.feature = 10,
+                             min.cells.group = 10)
+    
+    if (nrow(top_table) < 1) {
+      next
+    } else {
+      
+      top_table <- top_table %>% 
+        dplyr::arrange(desc(avg_log2FC)) %>%
+        as.data.frame() %>%
+        tibble::rownames_to_column("gene")
+      
+      pid <- as.character(unique(pat$predicted_id)) 
+      patient_id <- as.character(unique(pat$patient))
+      scde[[pid]][[patient_id]] <- top_table
+      
+    }
+  } 
+}
+
+
+```
+
+
+
+## Run FGSEA for each cell type
+```{r enrichment_analysis}
+
+gs_list <- pos_gs_list
+
+es_list <- list()
+for (cell_state in names(scde)) {
+  
+  tmp <- lapply(names(scde[[cell_state]]), function(arg) {
+    
+    patient <- arg
+    arg <- scde[[cell_state]][[arg]]
+    mystats <- arg$avg_log2FC
+    names(mystats) <- arg$gene
+    mystats <- mystats[is.finite(mystats)]
+    
+    if ((sum(duplicated(mystats)) / length(mystats)) > 0.2) {
+      
+      return(NULL)
+      
+    } else {
+    
+      es_res <- fgsea(pathways = gs_list, stats = mystats, nPermSimple = 100000, nproc = 8, gseaParam = 1) 
+  
+      if (nrow(es_res) > 0) {
+        
+        es_res <- es_res %>%
+          dplyr::arrange(pval) %>%
+          dplyr::mutate(predicted_id = cell_state, patient = patient)
+        
+        return(es_res)
+      }
+    }
+    
+  })
+  
+  es_list[[cell_state]] <- do.call("rbind", tmp)
+  
+}
+
+es_df <-  do.call("rbind", es_list)
+
+
+```
+
+## Heatmap and clustering of ES
+```{r heatmap_and_clustering_es, fig.width = 12}
+
+es_df_hsc <- es_df %>% dplyr::filter(!is.na(NES))
+
+mysurv <- surv_data %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(patient = gsub("^P", "Patient_", patient))
+
+pathways_remove <- c("ADIPOGENESIS", "UV_RESPONSE_UP", "UV_RESPONSE_DN", "PANCREAS_BETA_CELLS", "SPERMATOGENESIS", "ANGIOGENESIS", "COAGULATION", "APICAL_JUNCTION", "APICAL_SURFACE", "MYOGENESIS")
+
+pathways_to_include <- es_df_hsc %>%
+  dplyr::filter(padj < 0.1) %>%
+  dplyr::pull(pathway) %>%
+  unique()
+
+plotdata <- es_df_hsc %>%
+  dplyr::filter(pathway %in% pathways_to_include) %>%
+  dplyr::filter(padj < 0.1) %>%
+  dplyr::select(patient, pathway, NES) %>%
+  tidyr::pivot_wider(names_from = pathway, values_from = NES, values_fill = 0) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("patient") %>%
+  as.matrix() %>% 
+  t()
+
+mutation_data <- aml_data@meta.data %>%
+  dplyr::filter(time %in% "Diagnosis") %>%
+  dplyr::select(patient_manuscript_id, npm1, flt3_itd, flt3_tkd, kit, runx1, tp53, asxl1, other_mutations_ngs, initial_tx, response_to_initial_tx) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(npm1 = ifelse(npm1 %in% "Positive" | grepl("npm1", other_mutations_ngs, ignore.case = TRUE), "Positive", npm1),
+                tet2 = case_when(grepl("tet2", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable"),
+                dnmt3a = case_when(grepl("dnmt3a", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                   is.na(other_mutations_ngs) ~ NA,
+                                   TRUE ~ "Undetectable"),
+                idh1 = case_when(grepl("idh1", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable"),
+                idh2 = case_when(grepl("idh2", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable"),
+                flt3 = case_when(flt3_itd %in% "Positive" | flt3_tkd %in% "Positive" | grepl("FLT3", other_mutations_ngs) ~ "Positive",
+                                 flt3_itd %in% "Undetectable" | flt3_tkd %in% "Undetectable" ~ "Undetectable")) %>%
+  dplyr::left_join(mysurv, by = "patient_manuscript_id") %>%
+  dplyr::filter(patient_manuscript_id %in% colnames(plotdata)) %>%
+  dplyr::mutate(response_to_initial_tx = ifelse(response_to_initial_tx == "Complete response (CR)", "Complete response", response_to_initial_tx),
+                response_to_initial_tx = factor(response_to_initial_tx, levels = c("Complete response", "Partial response", "No response"))) %>%
+  dplyr::arrange(response_to_initial_tx)
+
+
+npm1 <- mutation_data$npm1
+names(npm1) <- mutation_data$patient
+dnmt3a <- mutation_data$dnmt3a
+names(dnmt3a) <- mutation_data$patient
+idh1 = mutation_data$idh1
+names(idh1) <- mutation_data$patient
+idh2 <- mutation_data$idh2
+names(idh2) <- mutation_data$patient
+flt3 <- mutation_data$flt3
+names(flt3) <- mutation_data$patient
+
+overall_survival <- as.numeric(mutation_data$time_dx_to_last_follow_up)
+names(overall_survival) <- mutation_data$patient
+time_to_relapse <- as.numeric(mutation_data$time_dx_to_re)
+names(time_to_relapse) <- mutation_data$patient
+response_to_initial_tx <- mutation_data$response_to_initial_tx
+names(response_to_initial_tx) <- mutation_data$patient
+initial_tx <- mutation_data$initial_tx
+names(initial_tx) <- mutation_data$patient
+  
+# Re-order ES data based on CITEseq metadata
+plotdata <- plotdata[, match(mutation_data$patient_manuscript_id, colnames(plotdata))]
+
+ha <- HeatmapAnnotation(
+    # "Overall survival" = overall_survival,
+    # "Time to relapse" = time_to_relapse,
+    "Initial treatment" = initial_tx,
+    "Response to chemotherapy" = response_to_initial_tx,
+    # NPM1 = npm1,
+    # FLT3 = flt3,
+    # DNMT3A = dnmt3a,
+    # IDH1 = idh1,
+    # IDH2 = idh2,
+    col = list(NPM1 = c("Undetectable" = "lightgreen", "Positive" = "magenta"),
+               DNMT3A = c("Undetectable" = "lightgreen", "Positive" = "magenta"),
+               IDH1 = c("Undetectable" = "lightgreen", "Positive" = "magenta"),
+               IDH2 = c("Undetectable" = "lightgreen", "Positive" = "magenta"),
+               FLT3 = c("Undetectable" = "lightgreen", "Positive" = "magenta"),
+               `Response to chemotherapy` = c("Complete response" = "cornflowerblue", "Partial response" = "brown", "No response" = "yellow"),
+               `Initial treatment` = c("3+7" = "aquamarine4", 
+                                       "Azacitidine" = "purple", 
+                                       "Clinical Trial with SGI" = "tomato1", 
+                                       "Clinical Trial with Temozolomide" = "olivedrab2", 
+                                       "CPX-351" = "dodgerblue", 
+                                       "FLAG-IDA" = "tan2")
+               ),
+    na_col = "lightgray",
+    annotation_name_side = "left"
+)
+
+
+set.seed(194914)
+mysplit <- kmeans(plotdata, 3)$cluster
+mysplit <- factor(mysplit, levels = c(1, 2, 3))
+
+myheatmap <- ComplexHeatmap::Heatmap(
+  plotdata,
+  cluster_rows = FALSE,
+  cluster_columns = TRUE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  clustering_method_rows = "ward.D2", 
+  #clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  column_km = 3,
+  #row_km = 3,
+  split = mysplit,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(2, "mm"),
+  row_gap = unit(2, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(plotdata), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+
+
+es_df_hsc <- es_df_hsc %>%
+  dplyr::mutate(cluster = case_when(grepl("_41|_50|_52|_54|_61|_67", patient) ~ "cluster_1",
+                                    grepl("26|_4|_43|_51|_64|_65|_70|_44", patient) ~ "cluster_3",
+                                    TRUE ~ "cluster_2"))
+
+ggboxplot(es_df_hsc, x = "cluster", y = "NES", facet.by = "pathway", fill = "cluster", palette = "npg", ylim = c(-4, 10)) + 
+  stat_compare_means()
+
+
+
+```
+
+
+# Single cell DE analysis across timepoints all blasts
+```{r de_and_enrichment}
+
+#blast_split <- SplitObject(dplyr::filter(blast_object, !predicted_id %in% "Unknown"), split.by = "patient")  
+
+scde <- list()
+for (patient_id in unique(blast_object$patient_manuscript_id)) {
+  
+  #set.seed(52949)
+  # cell_sample <- sample(colnames(pat), min(ncol(pat), 2000))
+  # pat <- subset(x = pat, cells = cell_sample)
+  pat <- blast_object %>% dplyr::filter(patient_manuscript_id %in% patient_id)
+  if (ncol(pat) < 50) next
+  pat <- CreateSeuratObject(counts = as(LayerData(pat, layer = "counts", assay = "RNA"), "dgCMatrix"), 
+                            meta.data = pat@meta.data)
+  pat <- NormalizeData(pat)
+  
+  Idents(pat) <- "time"
+  
+  if (min(table(pat$time)) < 10 | length(unique(pat$time)) < 2) next
+  
+  top_table <- FindMarkers(pat, 
+                           test.use = "wilcox", 
+                           #latent.vars = c("percent.mt"),
+                           ident.1 = "Relapse",
+                           ident.2 = "Diagnosis",
+                           random.seed = 56739, 
+                           max.cells.per.ident = min(table(pat$time)),
+                           logfc.threshold = log2(1.20),
+                           min.cells.feature = 10,
+                           min.cells.group = 10)
+  
+  if (nrow(top_table) < 1) {
+    next
+  } else {
+    
+    top_table <- top_table %>% 
+      dplyr::arrange(desc(avg_log2FC)) %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("gene")
+    
+    scde[[patient_id]] <- top_table
+    
+  }
+} 
+
+
+```
+
+
+
+## Run FGSEA
+```{r enrichment_analysis}
+
+gs_list <- pgs_list
+
+es_list <- lapply(names(scde), function(patient) {
+  
+  arg <- scde[[patient]]
+  mystats <- arg$avg_log2FC
+  names(mystats) <- arg$gene
+  mystats <- mystats[is.finite(mystats)]
+  
+  if ((sum(duplicated(mystats)) / length(mystats)) > 0.2) {
+    
+    return(NULL)
+    
+  } else {
+  
+    es_res <- fgsea(pathways = gs_list, stats = mystats, nPermSimple = 100000, nproc = 1, gseaParam = 1) 
+
+    if (nrow(es_res) > 0) {
+      
+      es_res <- es_res %>%
+        dplyr::arrange(pval) %>%
+        dplyr::mutate(patient = patient)
+      
+      return(es_res)
+    }
+  }
+  
+})
+  
+
+es_df <-  do.call("rbind", es_list)
+
+
+```
+
+## Heatmap and clustering of ES
+```{r heatmap_and_clustering_es, fig.width = 12, fig.height = 4.5}
+
+es_df_hsc <- es_df %>% dplyr::filter(!is.na(NES))
+tmp_surv_data <- surv_data %>%
+  dplyr::mutate(chr_stability = ifelse(patient %in% c("P61", "P29", "P30", "P50", "P28", "P49", "P52", "P43"), "unstable", "stable"),
+                hsct = ifelse(patient %in% c("P26", "P27", "P29", "P30", "P28", "P4", "P31"), "yes", "no"))
+
+pathways_to_include <- c("INFLAMMATORY_RESPONSE",
+                         "TNFA_SIGNALING_VIA_NFKB",
+                         "INTERFERON_ALPHA_RESPONSE",
+                         "IL6_JAK_STAT3_SIGNALING",
+                         "INTERFERON_GAMMA_REPONSE",
+                         "IL2_STAT5_SIGNALING",
+                         "COMPLEMENT",
+                         "TGF_BETA_SIGNALING",
+                         "MITOTIC_SPINDLE",
+                         "E2F_TARGETS",
+                         "MYC_TARGETS_V1",
+                         "MYC_TARGETS_V2",
+                         "G2M_CHECKPOINT",
+                         "OXIDATIVE_PHOSPHORYLATION"
+                         )
+                         
+plotdata <- es_df_hsc %>%
+  dplyr::filter(pathway %in% pathways_to_include) %>%
+  #dplyr::filter(pval < 0.2) %>%
+  dplyr::select(patient, pathway, NES) %>%
+  tidyr::pivot_wider(names_from = pathway, values_from = NES, values_fill = 0) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("patient") %>%
+  as.matrix() %>% 
+  t()
+
+pat_order <- plotdata[c("INFLAMMATORY_RESPONSE",
+                         "TNFA_SIGNALING_VIA_NFKB",
+                         "INTERFERON_ALPHA_RESPONSE",
+                         "IL6_JAK_STAT3_SIGNALING",
+                         "IL2_STAT5_SIGNALING",
+                         "COMPLEMENT",
+                         "TGF_BETA_SIGNALING"
+                        ), ]
+pat_order <- colMeans(pat_order)
+pat_order <- sort(pat_order, decreasing = TRUE)
+pat_order <- names(pat_order)
+plotdata <- plotdata[, pat_order]
+
+# Prepare mutation data
+mutation_data <- aml_data@meta.data %>%
+  dplyr::filter(time %in% "Diagnosis") %>%
+  dplyr::select(patient_manuscript_id, hsct, npm1, flt3_itd, flt3_tkd, kit, runx1, tp53, asxl1, other_mutations_ngs, initial_tx, response_to_initial_tx) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(npm1 = ifelse(npm1 %in% "Positive" | grepl("npm1", other_mutations_ngs, ignore.case = TRUE), "Positive", npm1),
+                tet2 = case_when(grepl("tet2", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable"),
+                dnmt3a = case_when(grepl("dnmt3a", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                   is.na(other_mutations_ngs) ~ NA,
+                                   TRUE ~ "Undetectable"),
+                idh1 = case_when(grepl("idh1", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable"),
+                idh2 = case_when(grepl("idh2", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable"),
+                flt3 = case_when(flt3_itd %in% "Positive" | flt3_tkd %in% "Positive" | grepl("FLT3", other_mutations_ngs) ~ "Positive",
+                                 flt3_itd %in% "Undetectable" | flt3_tkd %in% "Undetectable" ~ "Undetectable")) %>%
+  dplyr::left_join(mysurv, by = "patient_manuscript_id") %>%
+  dplyr::filter(patient_manuscript_id %in% colnames(plotdata)) %>%
+  dplyr::mutate(response_to_initial_tx = case_when(response_to_initial_tx == "Complete response (CR)" ~ "CR", 
+                                                   response_to_initial_tx == "Partial response" ~ "PR",
+                                                   response_to_initial_tx == "No response" ~ "PRD"),
+                response_to_initial_tx = factor(response_to_initial_tx, levels = c("CR", "PR", "PRD")),
+                hsct = ifelse(hsct == "HSCT", "HCT", hsct)) %>%
+  dplyr::arrange(response_to_initial_tx) %>%
+  dplyr::slice(match(pat_order, patient_manuscript_id))
+
+npm1 <- mutation_data$npm1
+names(npm1) <- mutation_data$patient_manuscript_id
+dnmt3a <- mutation_data$dnmt3a
+names(dnmt3a) <- mutation_data$patient_manuscript_id
+idh1 = mutation_data$idh1
+names(idh1) <- mutation_data$patient_manuscript_id
+idh2 <- mutation_data$idh2
+names(idh2) <- mutation_data$patient_manuscript_id
+flt3 <- mutation_data$flt3
+names(flt3) <- mutation_data$patient_manuscript_id
+
+overall_survival <- as.numeric(mutation_data$time_dx_to_last_follow_up)
+names(overall_survival) <- mutation_data$patient_manuscript_id
+time_to_relapse <- as.numeric(mutation_data$time_dx_to_re)
+names(time_to_relapse) <- mutation_data$patient_manuscript_id
+response_to_initial_tx <- mutation_data$response_to_initial_tx
+names(response_to_initial_tx) <- mutation_data$patient_manuscript_id
+initial_tx <- mutation_data$initial_tx
+names(initial_tx) <- mutation_data$patient_manuscript_id
+hsct <- mutation_data$hsct
+names(hsct) <- mutation_data$patient_manuscript_id
+# Re-order ES data based on CITEseq metadata
+adist <- mutation_data$adist
+mdist <- mutation_data$mutation_distance
+
+# Re-order ES data based on CITEseq metadata
+set.seed(34532)
+mysplit <- factor(kmeans(plotdata, 2)$cluster, levels = c(2, 1))
+set.seed(187134)
+colsplit <- factor(kmeans(t(plotdata), 3)$cluster, levels = c(3, 2, 1))
+
+# col_fun <- colorRamp2(quantile(as.numeric(as.matrix(sample_mut_filt[, -1])), 
+#                                probs = c(0.05, 0.5, 0.95), na.rm = TRUE), 
+#                       c("blue", "white", "red"))
+
+ha <- HeatmapAnnotation(
+    #`Aitchison D` = anno_barplot(adist, bar_width = 0.4, height = unit(3, "cm"), gp = gpar(fill = "azure4")),
+    #"Overall survival" = anno_barplot(overall_survival, height = unit(2, "cm")),
+    #"Time to relapse" = anno_barplot(time_to_relapse, height = unit(4, "cm")),
+    "Initial treatment" = ifelse(initial_tx == "3+7", "3+7", "Other"),
+    "Response to chemotherapy" = response_to_initial_tx,
+    HCT = hsct,
+    col = list(`Response to chemotherapy` = c("CR" = "plum1", "PR" = "brown", "PRD" = "darkorange"),
+               `Initial treatment` = c("3+7" = "aquamarine4", "Other" = "olivedrab2"), 
+               HSCT = c("HSCT" = "hotpink", "none" = "bisque")
+           ),
+    na_col = "lightgray",
+    annotation_name_side = "left"
+)
+
+myheatmap <- ComplexHeatmap::Heatmap(
+  plotdata,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  #clustering_method_rows = "ward.D2", 
+  #clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  top_annotation = ha,
+  na_col = "whitesmoke",
+  row_split = mysplit,
+  #column_split = colsplit,
+  cluster_row_slices = FALSE,
+  row_names_side = "left",
+  column_gap = unit(2, "mm"),
+  row_gap = unit(2, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11, angle = 45),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(plotdata), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+```
+
+## Pathway boxplots
+```{r pathway_boxplots}
+
+#Generate boxplots
+plotdata <- es_df_hsc %>%
+  dplyr::select(patient, pathway, NES) %>%
+  dplyr::rename(patient_manuscript_id = patient) %>%
+  tidyr::pivot_wider(names_from = pathway, values_from = NES, values_fill = NA) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("patient_manuscript_id") %>%
+  t()
+
+plotdata <- plotdata[, match(as.character(mutation_data$patient_manuscript_id), colnames(plotdata))]
+
+select_pathway <- c("INFLAMMATORY_RESPONSE",
+                     "TNFA_SIGNALING_VIA_NFKB",
+                     "INTERFERON_ALPHA_RESPONSE",
+                     "IL6_JAK_STAT3_SIGNALING",
+                     "IL2_STAT5_SIGNALING",
+                     "COMPLEMENT",
+                     "TGF_BETA_SIGNALING")
+
+response_plot_list <- lapply(select_pathway, function(arg) {
+  
+  boxdata <- data.frame(pathway = as.numeric(plotdata[arg, ]),
+                        response = mutation_data$response_to_initial_tx) %>%
+    dplyr::mutate(response = factor(ifelse(response %in% "CR", "CR", "PR/PRD"), levels = c("CR", "PR/PRD")))
+  
+  ggboxplot(boxdata,
+            x = "response",
+            y = "pathway",
+            xlab = "",
+            ylab = glue::glue("{arg} NES"),
+            fill = "wheat2",
+            legend = "none",
+            add = "jitter") +
+    stat_compare_means(comparisons = list(c(1, 2)), digits = 2, method = "t.test") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+})
+
+response_plot_list[[1]] + response_plot_list[[2]] + response_plot_list[[3]] + response_plot_list[[4]] + response_plot_list[[5]] + response_plot_list[[6]] + response_plot_list[[7]] + plot_layout(ncol = 4)
+
+hsct_plot_list <- lapply(select_pathway, function(arg) {
+  
+  boxdata <- data.frame(pathway = as.numeric(plotdata[arg, ]),
+                        hct = factor(hsct, levels = c("HCT", "none"))) 
+  
+  ggboxplot(boxdata,
+            x = "hct",
+            y = "pathway",
+            xlab = "",
+            ylab = glue::glue("{arg} NES"),
+            fill = "wheat2",
+            legend = "none",
+            add = "jitter") +
+    stat_compare_means(comparisons = list(c(1, 2)), digits = 2, method = "t.test") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+})
+
+hsct_plot_list[[1]] + hsct_plot_list[[2]] + hsct_plot_list[[3]] + hsct_plot_list[[4]] + hsct_plot_list[[5]] + hsct_plot_list[[6]] + hsct_plot_list[[7]] + plot_layout(ncol = 4)
+
+```
+
+## Feature plots of leading edge genes
+```{r leading_edge_genes}
+
+leg_df <- es_df_hsc %>%
+  dplyr::filter(pathway %in% c("E2F_TARGETS", "MYC_TARGETS_V1", "TNFA_SIGNALING_VIA_NFKB"))
+
+legs <- NULL
+for (mypath in unique(leg_df$pathway)) {
+  
+  legs[[mypath]] <- leg_df %>% dplyr::filter(pathway %in% mypath) %>% dplyr::pull(leadingEdge) %>% unlist() %>% c() %>% unique()
+
+}
+
+blast_object <- AddModuleScore(blast_object, legs, name = names(legs)) %>%
+  dplyr::rename(E2F_TARGETS = E2F_TARGETS1, 
+                MYC_TARGETS_V1 = MYC_TARGETS_V12, 
+                TNFA_SIGNALING_VIA_NFKB = TNFA_SIGNALING_VIA_NFKB3)
+
+test <- dplyr::filter(blast_object, patient == "Patient_26")
+DefaultAssay(test) <- "RNA"
+test <- ScaleData(test, features = rownames(test@assays$RNA))
+test <- AddModuleScore(test, legs, name = names(legs))
+
+VlnPlot(dplyr::filter(test, predicted_id %in% c("HSC", "MEP", "Monocyte", "DC", "preB")), 
+            features = c('E2F_TARGETS1', 'MYC_TARGETS_V12', 'TNFA_SIGNALING_VIA_NFKB3'), 
+            group.by = "predicted_id", 
+            split.by = "time", 
+            cols = c("blue", "red"),
+        pt.size = 0.1, alpha = 0.01)
+
+```
+
+# Compare relapse samples between responders and non-responders
+```{r respond_vs_non_responde_chemo}
+
+blast_object_dx <- dplyr::filter(blast_object, time == "Diagnosis") 
+blast_object_dx <- blast_object_dx %>% dplyr::mutate(response = ifelse(response_to_initial_tx == "Complete response (CR)", "CR", "NR"))
+Idents(blast_object_dx) <- "response"
+
+DefaultAssay(blast_object_dx) <- "ADT"
+response_de <- FindMarkers(blast_object_dx, ident.1 = "CR", ident.2 = "NR") %>%
+  dplyr::arrange(desc(avg_log2FC))
+
+
+
+heatmap_sample <- subset(blast_object_dx, cells = sample(colnames(blast_object_dx), 1000))
+myfeats <- rownames(response_de)
+myfeats <- myfeats[!grepl("isotype", myfeats, ignore.case = TRUE)]
+heatmap_sample <- ScaleData(heatmap_sample, features = myfeats)
+
+DoHeatmap(heatmap_sample,
+          features = myfeats,
+          group.by = "response")
+
+
+DefaultAssay(heatmap_sample) <- "RNA"
+heatmap_sample <- FindVariableFeatures(heatmap_sample, assay = "RNA")
+heatmap_sample <- ScaleData(heatmap_sample, assay = "RNA")
+heatmap_sample <- RunPCA(heatmap_sample, assay = "RNA")
+heatmap_sample <- FindNeighbors(heatmap_sample, assay = "RNA")
+heatmap_sample <- FindClusters(heatmap_sample)
+heatmap_sample <- RunUMAP(heatmap_sample, dims = 1:50, assay = "RNA")
+
+FeaturePlot(heatmap_sample, features = c("CD33", "CLL1", "CD34"), split.by = "response")
+
+
+dx_pb <- AggregateExpression(blast_object_dx, group.by = "patient", return.seurat = TRUE, assays = c("ADT", "RNA"))
+response <- dplyr::select(blast_object_dx, patient, response) %>% 
+  distinct() %>% 
+  dplyr::mutate(patient = gsub("_", "-", patient))
+dx_pb <- dplyr::left_join(dx_pb, response, by = "patient")
+dx_pb <- NormalizeData(dx_pb, assay = "ADT", normalization.method = "CLR", margin = 2)
+Idents(dx_pb) <- "response"
+response_pb_de <- FindMarkers(dx_pb, 
+                              ident.1 = "CR", ident.2 = "NR", 
+                              assay = "RNA", 
+                              max.cells.per.ident = min(table(dx_pb$response)), 
+                              test.use = "wilcox", 
+                              logfc.threshold = log2(1.2))
+mystats <- response_pb_de$avg_log2FC
+names(mystats) <- rownames(response_pb_de)
+response_es_res <- fgsea(pathways = pgs_list, stats = mystats, nPermSimple = 100000, nproc = 5, gseaParam = 1) %>%
+  dplyr::arrange(desc(NES))
+
+```
+
+# Cytogenetic analysis
+## Positional gene sets
+```{r cytogenetic_analysis}
+
+pseudobulk <- AggregateExpression(blast_object, assays = c("ADT", "RNA"), group.by = "sample_id")
+pseudobulk_rna <- pseudobulk$RNA
+
+myparam <- GSVA::gsvaParam(exprData = pseudobulk_rna, geneSets = pos_gs_list, kcdf = "Poisson", minSize = 5, sparse = TRUE)
+cyto_es <- GSVA::gsva(myparam)
+
+cyto_es_filt <- cyto_es[rowSums(cyto_es >= 0) < ncol(cyto_es), ]
+
+pheatmap(cyto_es_filt)
+
+
+pseudobulk_adt <- pseudobulk$ADT
+pseudobulk_adt <- sweep(pseudobulk_adt + 1, MARGIN = 2, STATS = colSums(pseudobulk_adt), FUN = "/") * 1e5
+pseudobulk_adt <- log2(pseudobulk_adt)
+
+cor_mat <- matrix(0, nrow(cyto_es_filt), nrow(pseudobulk_adt))
+rownames(cor_mat) <- rownames(cyto_es_filt)
+colnames(cor_mat) <- rownames(pseudobulk_adt)
+for (gset_ind in 1:nrow(cyto_es_filt)) {
+  for(marker_ind in 1:nrow(pseudobulk_adt)) {
+    
+    #cor_mat[gset_ind, marker_ind] <- cor(cyto_es_filt[gset_ind, ], pseudobulk_adt[marker_ind, ], method = "pearson", use =  "pairwise.complete.obs")
+    dep_samples <- ifelse(cyto_es_filt[gset_ind, ] < 0, "depleted", "enriched")
+    adt_expr <- pseudobulk_adt[marker_ind, ]
+    stopifnot(all(names(dep_samples) == names(adt_expr)))
+    mytest <- t.test(adt_expr ~ dep_samples)
+    
+    if (mytest$p.value > 0.1) {
+      cor_mat[gset_ind, marker_ind] <- 0
+    } else {
+      cor_mat[gset_ind, marker_ind] <- mytest$statistic
+    }
+  }
+}
+
+cor_mat[is.na(cor_mat) | cor_mat > 0] <- 0
+cor_mat <- cor_mat[rowSums(cor_mat == 0) < ncol(cor_mat), ]
+
+cor_mat <- as.data.frame(cor_mat) %>%
+  tibble::rownames_to_column("position") %>%
+  dplyr::mutate(chr = as.numeric(gsub("p.*|q.*|chr", "", position)),
+                arm = ifelse(grepl("p", position), "p", "q"),
+                arm_number = gsub(".*p|.*q", "", position)) %>%
+  dplyr::arrange(chr, arm, arm_number) %>%
+  dplyr::select(-arm, -arm_number, -chr) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("position")
+
+
+
+set.seed(34523532)
+myheatmap <- ComplexHeatmap::Heatmap(
+  t(cor_mat),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white", lwd = 2),
+  clustering_method_rows = "ward.D2", 
+  clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  na_col = "whitesmoke",
+  #column_km = 3,
+  row_km = 3,
+  row_names_side = "left",
+  column_gap = unit(2, "mm"),
+  row_gap = unit(2, "mm"),
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 11),
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  row_names_max_width = max_text_width(
+    rownames(cor_mat), 
+    gp = gpar(fontsize = 12)
+  )
+)
+
+draw(myheatmap, padding = unit(c(2, 20, 2, 2), "mm"), row_dend_side = "right")
+
+
+
+```
+
+## InferCNV
+```{r infercnv}
+
+aml_patients <- c("Patient_26",
+                  "Patient_27",
+                  "Patient_28",
+                  "Patient_29",
+                  "Patient_30",
+                  "Patient_31",
+                  "Patient_4",
+                  "Patient_40",
+                  "Patient_41",
+                  "Patient_42",
+                  "Patient_43",
+                  "Patient_44",
+                  "Patient_49",
+                  "Patient_50",
+                  "Patient_51",
+                  "Patient_52",
+                  "Patient_54",
+                  "Patient_56",
+                  "Patient_58",
+                  "Patient_60",
+                  "Patient_61",
+                  "Patient_64",
+                  "Patient_65",
+                  "Patient_66",
+                  "Patient_67",
+                  "Patient_70")
+
+healthy_samples <- c("Donor_1_Healthy", "Donor_2_Healthy", "Donor_3_Healthy", 
+                     "Donor_4_Healthy", "Donor_5_Healthy", "Donor_6_Healthy",
+                     "JD_Healthy_Donor_1_Healthy", "JD_Healthy_Donor_2_Healthy", 
+                     "JD_Healthy_Donor_3_Healthy", "JD_Healthy_Donor_4_Healthy")
+
+atlas <- readRDS("/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat_2024-04-03/aml_atlas_layered_seurat.rds")
+
+healthy_data_tmp <- readRDS("/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat_2024-04-03/reference.rds")
+healthy_cells <- healthy_data_tmp$barcode[healthy_data_tmp$cell_state_mnn_rna_l1 %in% c("Monocyte", "cDC", "pDC", "HSC", "MEP", "GMP", "preB")]
+healthy_metadata <- healthy_data_tmp@meta.data
+rm(healthy_data_tmp)
+
+atlas <- dplyr::filter(atlas, barcode %in% healthy_cells | barcode %in% blast_object$barcode)
+
+healthy_cells <- atlas$barcode[atlas$barcode %in% healthy_cells]
+set.seed(7798)
+healthy_cells <- sample(healthy_cells, 3000, replace = FALSE)
+
+for (mypat in aml_patients) {
+  
+  cat("\n", mypat)
+  atlas_sample <- dplyr::filter(atlas, patient %in% mypat | barcode %in% healthy_cells)
+  aml_cells_dx <- atlas_sample$barcode[!atlas_sample$barcode %in% healthy_cells & atlas_sample$time %in% "Diagnosis"]
+  set.seed(13410)
+  aml_cells_sample_dx <- sample(aml_cells_dx, min(length(aml_cells_dx), 3000), replace = FALSE)
+  aml_cells_re <- atlas_sample$barcode[!atlas_sample$barcode %in% healthy_cells & atlas_sample$time %in% "Relapse"]
+  set.seed(77893)
+  aml_cells_sample_re <- sample(aml_cells_re, min(length(aml_cells_re), 3000), replace = FALSE)
+  aml_cells_sample <- c(aml_cells_sample_dx, aml_cells_sample_re)
+  
+  atlas_sample <- subset(atlas_sample, cells = c(healthy_cells, aml_cells_sample))
+  atlas_sample_matrix <- as(LayerData(JoinLayers(atlas_sample), assay = "RNA", layer = "counts"), "dgCMatrix")
+  
+  atlas_sample_metadata <- dplyr::select(atlas_sample@meta.data, barcode, time) %>%
+    dplyr::left_join(dplyr::select(healthy_metadata, barcode, cell_state_mnn_rna_l1), by = "barcode") %>%
+    dplyr::mutate(time = ifelse(!is.na(cell_state_mnn_rna_l1), as.character(cell_state_mnn_rna_l1), as.character(time))) %>%
+    dplyr::select(-cell_state_mnn_rna_l1)
+  
+  stopifnot(ncol(atlas_sample_matrix) == nrow(atlas_sample_metadata))
+  
+  metadata_filepath <- glue::glue("/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/infercnv_output_18Nov2024/{mypat}/infercnv_annotation_file_{mypat}.txt")
+  if (!dir.exists(dirname(metadata_filepath))) dir.create(dirname(metadata_filepath))
+  write.table(atlas_sample_metadata, 
+              file =  metadata_filepath, 
+              sep = "\t", col.names = FALSE, row.names = FALSE)
+  
+  infercnv_obj <- infercnv::CreateInfercnvObject(raw_counts_matrix = atlas_sample_matrix,
+                                                 annotations_file =  metadata_filepath,
+                                                 delim = "\t",
+                                                 gene_order_file = "https://data.broadinstitute.org/Trinity/CTAT/cnv/hg38_gencode_v27.txt",
+                                                 ref_group_names = atlas_sample_metadata$time[grepl("Healthy", atlas_sample_metadata$barcode)],
+                                                 chr_exclude = c("chrY", "chrM")) 
+            
+  infercnv_obj <- infercnv::run(infercnv_obj,
+                                cutoff = 0.1,
+                                out_dir = glue::glue("/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/infercnv_output_18Nov2024/{mypat}"), 
+                                cluster_by_groups = TRUE, 
+                                denoise = TRUE,
+                                HMM = TRUE,
+                                hclust_method = "complete",
+                                k_obs_groups = 2,
+                                mask_nonDE_pval = 0.0,
+                                tumor_subcluster_partition_method = "leiden",
+                                num_threads = 10,
+                                output_format = "pdf")
+  
+}
+
+## upload InferCNV images
+myfiles <- list.files(path = "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/infercnv_output_15Nov2024",
+                      recursive = TRUE,
+                      full.names = TRUE,
+                      pattern = "infercnv.pdf")
+
+for (f in myfiles) {
+  
+ patient = basename(gsub("\\/infercnv.pdf", "", f))
+ fname <- paste(patient, "infercnv.pdf", sep = "_")
+ system(command = glue::glue("aws s3 cp {f} s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/InferCNV_output/v2/{fname}"))
+  
+}
+
+```
+
+### Correlate CNV with cell composition
+```{r cnv_cell_state_correlation}
+
+infercnv_dir <- "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/infercnv_output_4Nov2024"
+
+chr <- "^chr11"
+patient_dir <- list.files(infercnv_dir, full.names = TRUE)
+pat_cnv_list <- NULL
+for (pat in patient_dir) {
+  
+  cell_group <- read.delim(file.path(pat, "17_HMM_predHMMi6.leiden.hmm_mode-subclusters.cell_groupings")) %>%
+    dplyr::group_by(cell_group_name) %>%
+    dplyr::summarize(cell = n()) %>%
+    dplyr::ungroup()
+  
+  # keep cell subclusters with detected copy number loss in chromosome of interest and sum the number of cells across subclsuters
+  # we do counting at subcluster instead of cell level because single cell data is sparse. cell belonging to subcluster
+  # with a lot cells with CNV is assumed to have it as well due to its similarity in transcriptome profile
+  cnv_regions <- read.delim(file.path(pat, "17_HMM_predHMMi6.leiden.hmm_mode-subclusters.pred_cnv_regions.dat")) %>%
+    dplyr::filter(grepl(!!chr, cnv_name), state %in% c(1, 2), grepl("Diagnosis|Relapse", cell_group_name)) %>%
+    dplyr::mutate(time = ifelse(grepl("Diagnosis", cell_group_name), "Dx", "Re")) %>%
+    dplyr::select(cell_group_name, time) %>% # ignore the number of regions being deleted. as long as there is just one region, it's enough
+    dplyr::left_join(cell_group, by = "cell_group_name") %>%
+    dplyr::group_by(time) %>%
+    dplyr::summarize(pct_cells_with_cn_loss = sum(cell) / 1000) %>%
+    dplyr::group_by()
+
+  pat_cnv_list[[basename(pat)]] <-data.frame(patient = gsub("Patient_", "P", basename(pat)), cnv_regions)
+  
+}
+
+pat_cnv <- do.call("rbind", pat_cnv_list) %>%
+  dplyr::right_join(cluster_summary, by = c("patient", "time"))
+
+pat_cnv_filt <- pat_cnv %>%
+  dplyr::filter(`Blast cell state` %in% c("HSC")) 
+
+ggscatter(data = pat_cnv_filt,
+          x = "pct",
+          y = "pct_cells_with_cn_loss",
+          color = "time",
+          cor.coef = TRUE,
+          cor.method = "spearman",
+          label = "patient") +
+  geom_smooth(method = "lm", lty = 2, lwd = 0.5, se = FALSE)
+
+
+
+
+pat_cnv_filt <- pat_cnv_filt %>%
+  dplyr::mutate(pct_binary = factor(ifelse(pct > 90, "HSC-dominant", "Other"), levels = c("HSC-dominant", "Other")),
+                sample_id = paste0(patient, substring(time, 1, 1)),
+                label = ifelse(pct_binary %in% "HSC-dominant", sample_id, NA))
+
+ggboxplot(data = pat_cnv_filt,
+          x = "pct_binary",
+          y = "pct_cells_with_cn_loss",
+          xlab = "",
+          ylab = "Fraction of cells with deletion in chr11",
+          add = "jitter",
+          fill = "cornflowerblue") +
+  stat_compare_means(label.x = 0.85, label.y = 0.95)
+
+```
+
+# Immunophenotypic subtypes 
+```{r ip_subs}
+
+hsc_blasts <- dplyr::filter(blast_object, predicted_id %in% "HSC")
+
+DefaultAssay(hsc_blasts) <- "RNA"
+
+hsc_blasts[["RNA"]] <- split(hsc_blasts[["RNA"]], f = hsc_blasts$patient)
+hsc_blasts <- NormalizeData(hsc_blasts)
+hsc_blasts <- FindVariableFeatures(hsc_blasts)
+hsc_blasts <- ScaleData(hsc_blasts)
+hsc_blasts <- RunPCA(hsc_blasts)
+hsc_blasts <- IntegrateLayers(object = hsc_blasts, 
+                              method = HarmonyIntegration, 
+                              orig.reduction = "pca",
+                              new.reduction = 'harmony', 
+                              verbose = FALSE)
+
+hsc_blasts <- RunUMAP(hsc_blasts, reduction = "harmony", dims = 1:50)
+
+DimPlot(hsc_blasts, group.by = "seurat_clusters", reduction = "umap")
+
+Idents(hsc_blasts) <- "seurat_clusters"
+hsc_markers <- FindAllMarkers(hsc_blasts, only.pos = TRUE, assay = "ADT")
+
+```
+
+# Cellchat analysis
+```{r cellchat_analysis}
+
+aml_sample <- subset(aml_data, cells = sample(colnames(aml_data)[aml_data$time == "Relapse"], 10000))
+DefaultAssay(aml_sample) <- "RNA"
+aml_sample <- NormalizeData(aml_sample)
+
+data.input <- LayerData(aml_sample, layer = "data", assay = "RNA")
+labels <- aml_sample$predicted_id
+meta <- data.frame(labels = labels, samples = aml_sample$sample_id, row.names = names(labels)) # create a dataframe of the cell labels
+meta$labels <- droplevels(meta$labels)
+
+cellchat <- CellChat::createCellChat(object = as(data.input, "dgCMatrix"), meta = meta, group.by = "labels")
+
+CellChatDB <- CellChatDB.human
+# use a subset of CellChatDB for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling", key = "annotation") # use Secreted Signaling
+cellchat@DB <- CellChatDB.use
+cellchat <- CellChat::subsetData(cellchat) # This step is necessary even if using the whole database
+future::plan("multisession", workers = 4) # do parallel
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+
+cellchat <- computeCommunProb(cellchat, type = "triMean")
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+
+groupSize <- as.numeric(table(cellchat@idents))
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+
+
+mat <- cellchat@net$weight
+par(mfrow = c(3, 4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+
+netVisual_heatmap(cellchat, signaling = pathways.show, color.heatmap = "Reds")
+
+```
+
+
+
+
+
+# LSCs
+## Find signature for LSCs
+```{r lsc_surface_markers}
+
+Idents(blast_object) <- "lsc"
+DefaultAssay(blast_object) <- "ADT"
+
+top_table <- FindMarkers(blast_object,
+                         latent.vars = "patient",
+                         ident.1 = "LSC",
+                         logfc.threshold = log2(1.2))
+
+
+DefaultAssay(blast_object) <- "RNA"
+tmp <- subset(blast_object, cells = sample(colnames(blast_object), 5000))
+tmp <- CreateSeuratObject(counts = as(LayerData(tmp, assay = "RNA", layer = "counts"), "dgCMatrix"), meta.data = tmp@meta.data)
+Idents(tmp) <- "lsc"
+top_table_rna <- FindMarkers(tmp,
+                             test.use = "MAST",
+                             latent.vars = c("patient", "nCount_RNA", "mt.percent"),
+                             ident.1 = "LSC",
+                             logfc.threshold = log2(1.2))
+
+mystats <- top_table_rna$avg_log2FC
+names(mystats) <- rownames(top_table_rna)
+mystats <- mystats[is.finite(mystats)]
+es_lsc <- fgsea(pathways = pgs_list, stats = mystats)
+
+```
+
+## Differential expression analysis between relapse and relapse groups
+### Single cell
+```{r de_and_enrichment}
+
+set.seed(13107)
+sample_n <- 5000
+set1 <- sample(colnames(lsc_object)[lsc_object$time == "Diagnosis"], sample_n)
+set2 <- sample(colnames(lsc_object)[lsc_object$time == "Relapse"], sample_n)
+
+tmp <- subset(lsc_object, cells = c(set1, set2))
+tmp <- CreateSeuratObject(counts = as(LayerData(tmp, assay = "RNA", layer = "counts"), "dgCMatrix"), meta.data = tmp@meta.data)
+keep_features <- rowSums(tmp@assays$RNA@counts)
+tmp <- subset(tmp, features = names(keep_features)[keep_features > 50])
+tmp <- NormalizeData(tmp, assay = "RNA", normalization.method = "LogNormalize")
+
+Idents(tmp) <- "time"
+DefaultAssay(tmp) <- "RNA"
+top_table <- FindMarkers(tmp, 
+                         test.use = "MAST", 
+                         latent.vars = c("patient", "percent.mt"),
+                         ident.1 = "Relapse",
+                         ident.2 = "Diagnosis",
+                         random.seed = 565099, 
+                         min.cells.feature = 10,
+                         min.cells.group = 10
+                         )
+
+# top_table <- FindMarkers(tmp, 
+#                          test.use = "wilcox",
+#                          ident.1 = "Relapse",
+#                          ident.2 = "Diagnosis",
+#                          random.seed = 565099, 
+#                          min.cells.feature = 10,
+#                          min.cells.group = 10
+#                          )
+
+top_table <- top_table %>%
+  dplyr::arrange(p_val) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene")
+
+EnhancedVolcano(top_table,
+                lab = top_table$gene,
+                x = 'avg_log2FC',
+                y = 'p_val')
+
+#fgsea
+mystats <- top_table$avg_log2FC
+names(mystats) <- top_table$gene
+mystats <- mystats[is.finite(mystats)]
+es_res <- fgsea(pathways = pgs_list, stats = mystats, nPermSimple = 10000) %>%
+  dplyr::arrange(pval)
+
+sig_paths <- es_res$pathway[es_res$padj < 0.05]
+
+plotEnrichment(pgs_list[["HALLMARK_TNFA_SIGNALING_VIA_NFKB"]], mystats) + ggtitle("HALLMARK_TNFA_SIGNALING_VIA_NFKB") + theme(plot.title = element_text(size = 9))
+plotEnrichment(pgs_list[["HALLMARK_HYPOXIA"]], mystats) + ggtitle("HALLMARK_HYPOXIA") + theme(plot.title = element_text(size = 9))
+plotEnrichment(pgs_list[["HALLMARK_INTERFERON_GAMMA_RESPONSE"]], mystats) + ggtitle("HALLMARK_INTERFERON_GAMMA_RESPONSE") + theme(plot.title = element_text(size = 9))
+plotEnrichment(pgs_list[["HALLMARK_MYC_TARGETS_V1"]], mystats) + ggtitle("HALLMARK_MYC_TARGETS_V1") + theme(plot.title = element_text(size = 9))
+
+```
+
+```{r de_analysis_per_patient}
+
+lsc_object_split <- SplitObject(lsc_object, split.by = "patient")
+
+de_list <- NULL
+es_list <- NULL
+
+for(pat in lsc_object_split) {
+  
+  Idents(pat) <- "time"
+  
+  if (length(unique(pat$time)) < 2 | min(table(pat$time)) < 20) next  
+  
+  top_table <- FindMarkers(pat, 
+                           test.use = "wilcox", 
+                           ident.1 = "Relapse",
+                           ident.2 = "Diagnosis",
+                           random.seed = 56739, 
+                           #max.cells.per.ident = 1.2 * min(table(pat$time)),
+                           min.cells.feature = 10,
+                           min.cells.group = 10) %>%
+    dplyr::arrange(p_val)
+  
+  de_list[[unique(pat$patient)]] <- top_table
+    
+}
+
+for (pat in names(de_list)) {
+  
+  mystats <- de_list[[pat]]$avg_log2FC
+  names(mystats) <- rownames(de_list[[pat]])
+  mystats <- mystats[is.finite(mystats)]
+  
+  es_list[[pat]] <- fgsea(pathways = pgs_list, stats = mystats, nPermSimple = 10000) %>%
+    dplyr::arrange(pval) %>%
+    dplyr::mutate(patient = gsub("Patient_", "P", pat))
+
+}
+
+es_df <-  do.call("rbind", es_list)
+
+plotdata <- es_df %>%
+  dplyr::filter(padj < 0.1) %>%
+  dplyr::mutate(pval = -log10(pval)) %>%
+  dplyr::mutate(pval = ifelse(NES > 0, pval, -pval)) %>%
+  dplyr::select(patient, pathway, NES) %>%
+  dplyr::mutate(pathway = gsub("HALLMARK_", "", pathway)) %>%
+  tidyr::pivot_wider(names_from = pathway, values_from = NES, values_fill = 0) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("patient") %>%
+  as.matrix() %>% 
+  t()
+
+mutation_data <- aml_data@meta.data %>%
+  dplyr::filter(time %in% "Diagnosis") %>%
+  dplyr::select(patient, npm1, flt3_itd, flt3_tkd, kit, runx1, tp53, asxl1, other_mutations_ngs) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(npm1 = ifelse(npm1 %in% "Positive" | grepl("npm1", other_mutations_ngs, ignore.case = TRUE), "Positive", npm1),
+                tet2 = case_when(grepl("tet2", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable"),
+                dnmt3a = case_when(grepl("dnmt3a", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                   is.na(other_mutations_ngs) ~ NA,
+                                   TRUE ~ "Undetectable"),
+                idh1 = case_when(grepl("idh1", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable"),
+                idh2 = case_when(grepl("idh2", other_mutations_ngs, ignore.case = TRUE) ~ "Positive",
+                                 is.na(other_mutations_ngs) ~ NA,
+                                 TRUE ~ "Undetectable")) %>%
+  dplyr::mutate(patient = gsub("Patient_", "P", patient)) %>%
+  dplyr::left_join(surv_data, by = "patient") %>%
+  dplyr::arrange(desc(time_dx_to_last_follow_up)) %>%
+  dplyr::filter(patient %in% colnames(plotdata))
+
+plotdata <- plotdata[, match(mutation_data$patient, colnames(plotdata))]
+
+npm1 <- mutation_data$npm1
+names(npm1) <- mutation_data$patient
+dnmt3a <- mutation_data$dnmt3a
+names(dnmt3a) <- mutation_data$patient
+idh1 = mutation_data$idh1
+names(idh1) <- mutation_data$patient
+idh2 <- mutation_data$idh2
+names(idh2) <- mutation_data$patient
+
+overall_survival <- as.numeric(mutation_data$time_dx_to_last_follow_up)
+names(overall_survival) <- mutation_data$patient
+
+ha <- HeatmapAnnotation(
+  "Overall survival" = overall_survival,
+  NPM1 = npm1, 
+  DNMT3A = dnmt3a,
+  IDH1 = idh1,
+  IDH2 = idh2,
+  col = list(NPM1 = c("Undetectable" = "black", "Positive" = "magenta"),
+             DNMT3A = c("Undetectable" = "black", "Positive" = "magenta"),
+             IDH1 = c("Undetectable" = "black", "Positive" = "magenta"),
+             IDH2 = c("Undetectable" = "black", "Positive" = "magenta")
+             ),
+  na_col = "gray"
+)
+
+ComplexHeatmap::Heatmap(
+  plotdata,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  #clustering_method_rows = "ward.D2", 
+  #clustering_method_columns = "ward.D2",
+  show_column_names = TRUE,
+  top_annotation = ha,
+  #column_split = as.factor(gsub(".*-|_relapse", "", colnames(myheat_top))),
+  #column_gap = unit(2, "mm"),
+  #row_gap = unit(2, "mm"),
+  #col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 13),
+  #row_split = row_split,
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  #use_raster = FALSE
+)
+
+
+```
+
+### Pseudobulk
+```{r pseudobulk_de}
+
+lsc_pseudobulk <- AggregateExpression(lsc_object, group.by = c("sample_id"), return.seurat = TRUE, assays = "RNA") %>%
+  dplyr::mutate(sample_id = gsub("Patient-", "P", sample_id)) %>%
+  tidyr::separate(sample_id, into = c("patient", "time"), sep = "-")
+
+feature_sums <- rowSums(LayerData(lsc_pseudobulk, assays = "RNA", layer = "counts"))
+lsc_pseudobulk <- subset(lsc_pseudobulk, features = rownames(lsc_pseudobulk@assays$RNA)[feature_sums > 1000])
+lsc_pseudobulk <- dplyr::mutate(lsc_pseudobulk, time = factor(time, levels = c("Diagnosis", "Relapse")), patient = factor(patient))
+
+# limma-voom
+design_matrix <- model.matrix(~time + patient, data = lsc_pseudobulk@meta.data)
+
+v <- limma::voom(counts = as.matrix(LayerData(lsc_pseudobulk, layer = "counts", assay = "RNA")),
+                 design = design_matrix,
+                 plot = TRUE,
+                 normalize = "quantile")
+
+fit <- limma::lmFit(v, design = design_matrix)
+fit <- limma::eBayes(fit)
+top_table_limma <- limma::topTable(fit, number = Inf, coef = "timeRelapse", sort.by = "P")
+
+mystats <- top_table_limma$logFC
+names(mystats) <- rownames(top_table_limma)
+mystats <- mystats[is.finite(mystats)]
+es_res <- fgsea(pathways = pgs_list, stats = mystats, nPermSimple = 10000) %>%
+  dplyr::arrange(pval)
+
+es_res
+
+#edgeR
+lsc_pseudobulk <- edgeR::Seurat2PB(lsc_object, cluster = "time", sample = "sample_id")
+lsc_pseudobulk$samples$patient <- gsub("_relapse|_Relapse", "", lsc_pseudobulk$samples$sample)
+keep.genes <- filterByExpr(lsc_pseudobulk, min.count = 10, min.total.count = 100)
+lsc_pseudobulk <- lsc_pseudobulk[keep.genes, , keep = FALSE]
+lsc_pseudobulk <- normLibSizes(lsc_pseudobulk)
+
+cluster <- as.factor(lsc_pseudobulk$samples$cluster)
+patient <- as.factor(lsc_pseudobulk$samples$patient)
+
+design <- model.matrix(~ 0 + cluster + patient)
+con <- makeContrasts(clusterRelapse - clusterrelapse, levels = design)
+lsc_pseudobulk <- estimateDisp(lsc_pseudobulk, design, robust = TRUE)
+fit <- glmQLFit(lsc_pseudobulk, design, robust = TRUE)
+qlf <- glmQLFTest(fit, contrast = con)
+top_table_edger <- qlf$table
+top_table_edger <- top_table_edger %>%
+  dplyr::mutate(padj = p.adjust(PValue, method = "BH")) %>%
+  dplyr::arrange(PValue)
+
+EnhancedVolcano(top_table_edger,
+                lab = top_table_edger %>% rownames,
+                x = 'logFC',
+                y = 'PValue',
+                FCcutoff = 0.5,
+                pCutoff = 0.05)
+
+
+mystats <- top_table_edger$logFC
+names(mystats) <- rownames(top_table_edger)
+mystats <- mystats[is.finite(mystats)]
+es_res <- fgsea(pathways = pgs_list, stats = mystats, nPermSimple = 10000) %>%
+  dplyr::arrange(pval)
+
+es_res
+ 
+```
+
+
+
+
+
+
+
+
+
+
+
+
+## Enrichment analysis
+### Run FGSEA
+```{r enrichment_analysis}
+
+
+es_list <- list()
+for (cell_state in names(scde)) {
+  
+  tmp <- lapply(names(scde[[cell_state]]), function(arg) {
+    
+    patient <- arg
+    arg <- scde[[cell_state]][[arg]]
+    mystats <- arg$avg_log2FC
+    names(mystats) <- arg$gene
+    
+    es_res <- fgsea(pathways = pgs_list, stats = mystats, nPermSimple = 10000) 
+
+    if (nrow(es_res) > 0) {
+      es_res <- es_res %>%
+        dplyr::arrange(pval) %>%
+        dplyr::mutate(predicted_id = cell_state, patient = patient)
+      return(es_res)
+    }
+    
+  })
+  
+  es_list[[cell_state]] <- do.call("rbind", tmp)
+  
+}
+
+es_df <-  do.call("rbind", es_list)
+
+
+```
+
+## GSVA on LSC pseudobulk
+```{r gsva_lscs}
+
+lsc_pseudobulk <- AggregateExpression(lsc_object, group.by = c("sample_id"))
+lsc_pseudobulk_rna <- lsc_pseudobulk$RNA
+
+gsvaPar <- gsvaParam(lsc_pseudobulk_rna, pgs_list)
+sse <- GSVA::gsva(gsvaPar)
+
+res <- c()
+for (gs in rownames(sse)) {
+  
+  x <- sse[, grepl("Relapse", colnames(sse))]
+  colnames(x) <- gsub("-Relapse", "", colnames(x))
+  y <- sse[, grepl("Diagnosis", colnames(sse))]
+  colnames(y) <- gsub("-Diagnosis", "", colnames(y))
+  int <- intersect(colnames(x), colnames(y))
+  res[gs] <- wilcox.test(x[gs, colnames(x) %in% int], y[gs, colnames(y) %in% int], paired = TRUE)$p.value
+  
+}
+
+res <- sort(res)
+
+
+```
+
+
+
