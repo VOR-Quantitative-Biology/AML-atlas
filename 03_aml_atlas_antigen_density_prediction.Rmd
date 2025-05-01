@@ -1,0 +1,3049 @@
+---
+title: "Inference of antigen density by integrating CITEseq and flow cytometry data"
+author: "Matt Ung"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    code_folding: hide
+    theme: yeti
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+
+library(devtools)
+library(flowCore)
+library(SeuratObject)
+library(BPCells)
+library(Seurat)
+library(SeuratDisk)
+library(dplyr)
+library(aws.s3)
+library(tibble)
+library(tidyr)
+library(dotenv)
+library(ggplot2)
+library(ggpubr)
+library(glue)
+library(DoubletFinder)
+library(tidyseurat)
+library(pzfx)
+library(preprocessCore)
+library(pals)
+library(EnhancedVolcano)
+library(SeuratWrappers)
+library(alphahull)
+library(igraph)
+library(reticulate)
+library(viridis)
+library(msigdbr)
+library(GSVA)
+library(escape)
+library(dittoSeq)
+library(fgsea)
+library(GSEABase)
+library(ggbeeswarm)
+library(circlize)
+library(pheatmap)
+library(biomaRt)
+library(SingleCellExperiment)
+library(Matrix)
+library(stringr)
+library(ComplexHeatmap)
+library(future)
+library(circlize)
+library(msigdbr)
+library(survival)
+library(survminer)
+library(broom)
+library(scales)
+library(lubridate)
+library(future)
+library(ggsci)
+library(bazar)
+library(flowCore)
+library(mclust)
+library(doParallel)
+library(foreach)
+library(scales)
+library(tictoc)
+library(randomForest)
+library(e1071)
+library(survminer)
+library(robCompositions)
+
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 1e9)
+
+load_dot_env(file = "/home/rstudio/data/bitbucket/.env")
+
+knitr::opts_knit$set(root.dir = "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas")
+
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = Sys.getenv("key"),
+  "AWS_SECRET_ACCESS_KEY" = Sys.getenv("secret"),
+  "AWS_DEFAULT_REGION" = "us-east-1"
+)
+
+cl <- makeCluster(6)
+registerDoParallel(cl)
+
+```
+
+# Calculate coverage function
+```{r calculate_coverage}
+
+calculate_coverage <- function(imputed_abc_df, fmo_threshold_df = NULL, target_threshold = 100, label_threshold = 50, first_antigen, second_antigen) {
+
+  imputed_abc_coverage <- imputed_abc_df %>%
+    tibble::rownames_to_column("cell_barcode") %>%
+    dplyr::mutate(time = gsub(".*_", "", cell_barcode),
+                  patient = gsub("_Diagnosis|_Relapse", "", cell_barcode),
+                  patient = gsub(".*-", "", patient)) %>%
+    dplyr::select(patient, time, one_of(first_antigen), one_of(second_antigen))
+  
+  colnames(imputed_abc_coverage) <- c("patient", "time", "first_antigen", "second_antigen")
+  
+  if (!is.null(fmo_threshold_df)) {
+    
+    imputed_abc_coverage <- imputed_abc_coverage %>%
+      dplyr::left_join(fmo_threshold_df, by = "patient") %>%
+      dplyr::group_by(patient, time) %>%
+      dplyr::summarize(percent_first_ag = sum(first_antigen > fmo_ag_density_boundary) / n() * 100,
+                       percent_second_ag = sum(second_antigen > fmo_ag_density_boundary) / n() * 100) %>%
+      dplyr::ungroup()
+    
+  } else {
+    
+    imputed_abc_coverage <- imputed_abc_coverage %>%
+      dplyr::group_by(patient, time) %>%
+      dplyr::summarize(percent_first_ag = sum(first_antigen > target_threshold) / n() * 100,
+                       percent_second_ag = sum(second_antigen > target_threshold) / n() * 100) %>%
+      dplyr::ungroup()
+    
+  }
+  
+  imputed_abc_coverage <- imputed_abc_coverage %>%
+    tidyr::unite(col = label, patient, time, sep = "_", remove = FALSE) %>%
+    dplyr::mutate(label = ifelse(percent_first_ag < label_threshold | percent_second_ag < label_threshold, label, ""))
+    
+  return(imputed_abc_coverage)
+  
+}
+
+```
+
+
+# Load data objects
+```{r load_objects}
+
+aml_data <- aws.s3::s3readRDS(object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/seurat_v5/seurat_2024-04-03/aml_data_v4.rds")
+
+patient_order <- c("P26", "P44", "P52", "P70", "P61", "P31", "P43", "P30", "P64", "P56", "P54", "P27", "P41", "P49", "P51", "P50", "P66", "P29", "P67", "P42", "P65", "P60", "P58", "P28", "P40", "P4") 
+patient_id_map <- data.frame(patient = patient_order, 
+                             patient_manuscript_id = paste0("P", 1:length(patient_order))) %>%
+  dplyr::mutate(patient = factor(patient, levels = patient_order),
+                patient_manuscript_id = ifelse(nchar(patient_manuscript_id) == 2, gsub("P", "P0", patient_manuscript_id), patient_manuscript_id),
+                patient_manuscript_id = factor(patient_manuscript_id, levels = patient_manuscript_id))
+
+aml_data <- aml_data %>%
+  dplyr::left_join(dplyr::mutate(patient_id_map, patient = gsub("^P", "Patient_", patient)), by = "patient") %>%
+  dplyr::mutate(sample_manuscript_id = ifelse(sample_status == "Diagnosis", paste0(patient_manuscript_id, "D"), paste0(patient_manuscript_id, "R")))
+
+blast_object <- dplyr::filter(aml_data, cell_state_harmony_rna %in% "Blast")
+
+```
+
+# Load .fcs files
+```{r flow_data_exploratory_analysis}
+
+flow_paths <- aws.s3::get_bucket(bucket = "vorbio-datascience", 
+                                 prefix = "genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data",
+                                 max = Inf)
+flow_paths <- lapply(flow_paths, `[`, 1) %>% unlist()
+flow_paths <- flow_paths[grepl(".fcs", flow_paths)]
+flow_paths <- paste0("s3://vorbio-datascience/", flow_paths[grepl("patients_", flow_paths)])
+flow_paths <- flow_paths[!grepl("patients_47_48", flow_paths)]
+
+mynames <- gsub("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/|.fcs", "", flow_paths)
+
+flow_list <- lapply(flow_paths, function(object_path) aws.s3::s3read_using(FUN = flowCore::read.FCS, 
+                                                                           transformation = FALSE, 
+                                                                           truncate_max_range = TRUE, 
+                                                                           object = object_path))
+names(flow_list) <- mynames
+
+flow_list <- lapply(flow_list, function(arg) flowCore::transform(arg, `PE-A` = asinh(`PE-A`)))
+
+flow_list_qb <- flow_list[grepl("quantibrite", names(flow_list), ignore.case = TRUE)]
+flow_list_lsc <- flow_list[grepl("LSC", names(flow_list), ignore.case = TRUE)]
+flow_list_fmo <- flow_list[grepl("FMO", names(flow_list), ignore.case = TRUE)]
+flow_list_ags <- flow_list[grepl("blasts_PE+", names(flow_list), ignore.case = TRUE)]
+flow_list_ags_live <- flow_list[grepl("Live", names(flow_list), ignore.case = TRUE)]
+
+sample_df <- lapply(names(flow_list_ags), function(arg) {
+  
+  fi_matrix <- exprs(flow_list_ags[[arg]])
+  
+  if (nrow(fi_matrix) == 0) {
+    return(NULL)
+  } else {
+    data.frame(cell = paste0(arg, "-cell_", 1:nrow(fi_matrix)),
+               sample = arg,
+               fi_matrix)
+  }
+  
+})
+
+
+```
+
+# Check blast percentage concordance
+```{r check_blast_percentage}
+
+blast_counts <- table(aml_data$cell_state_harmony_rna, aml_data$sample_id)
+#blast_counts <- table(aml_data$predicted_id_blast, aml_data$sample_id)
+
+col_sums <- colSums(blast_counts)
+blast_counts <- sweep(x = blast_counts, MARGIN = 2, STATS = col_sums, FUN = "/")
+blast_percent <- blast_counts["Blast", , drop = FALSE] %>% 
+  t() %>%
+  as.data.frame.matrix() %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::mutate(Blast = Blast * 100)
+                      
+blast_metadata <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                       object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_atlas_sample_metadata.csv") %>%
+  dplyr::select(sample_id, blast_percent_vor) %>%
+  dplyr::filter(!grepl("Healthy", sample_id)) %>%
+  dplyr::filter(!is.na(blast_percent_vor))
+
+blast_data <- dplyr::inner_join(blast_percent, blast_metadata, by = "sample_id")
+model_res <- lm(blast_percent_vor ~ Blast, data = blast_data)$residuals
+blast_data <- dplyr::mutate(blast_data, residuals = model_res, abs_dev = abs(Blast - blast_percent_vor)) %>%
+  dplyr::mutate(`Model` = ifelse(abs(residuals) < 25, "yes", "no"))
+
+deviant_samples <- blast_data$sample_id[blast_data$Model == "no"]
+
+ggpubr::ggscatter(blast_data,
+                  x = "Blast",
+                  y = "blast_percent_vor",
+                  xlab = "CITEseq blast %",
+                  ylab = "Flow blast %",
+                  xlim = c(1, 100),
+                  ylim = c(1, 100),
+                  label = "sample_id",
+                  cor.coef = FALSE,
+                  label.select = blast_data$sample_id[blast_data$Model == "no"],
+                  repel = TRUE,
+                  font.label = c(8, "plain"),
+                  size = 2) +
+  geom_abline(slope = 1, lty = 2)
+
+ggpubr::ggscatter(blast_data,
+                  x = "Blast",
+                  y = "blast_percent_vor",
+                  color = "Model",
+                  xlab = "CITEseq blast %",
+                  ylab = "Flow blast %",
+                  xlim = c(1, 100),
+                  ylim = c(1, 100),
+                  cor.coef = TRUE,
+                  cor.coef.coord = c(0, 100),
+                  palette = c("lightgray", "orchid1"),
+                  size = 2) +
+  geom_abline(slope = 1, lty = 2)
+
+
+```
+
+# Compare ADT and FI quantiles
+## All blasts
+```{r adt_ab_quantiles_blast, fig.width = 12, fig.height = 8}
+
+flow_list_ags_all_blasts <- flow_list[!grepl("_PE+|Quantibrite|LSC|Live|LP|PE_blasts", names(flow_list), ignore.case = TRUE)]
+
+# compute FI quantiles
+myprobs <- 0.05
+df_list <- NULL
+df_quantile_list <- NULL
+df_bin_list <- NULL
+for (ag in c("CD33", "CLL1", "CD123", "EMR2")) {
+  
+  flow_list_ags_select <- flow_list_ags_all_blasts[grepl(ag, names(flow_list_ags_all_blasts))]
+
+  for (mynam in names(flow_list_ags_select)) {
+    
+    patient_id <- gsub(".*\\/", "", mynam)
+    patient_id <- gsub("_.*", "", patient_id)
+    
+    # extract FIs from flowCore object
+    fluor <- flow_list_ags_select[[mynam]]@parameters@data
+    fluor <- as.character(fluor$name[fluor$desc %in% ag])
+    fi <- exprs(flow_list_ags_select[[mynam]])
+    fi <- fi[, colnames(fi) %in% fluor]
+    if (length(fi) == 0) next
+    
+    myq <- quantile(fi, probs = seq(0, 1, myprobs), na.rm = TRUE) # compute quantiles
+    myq_bin <- NULL
+    for (q in 2:length(myq)) {
+      myq_bin[paste0("bin_", q-1)] <- mean(fi[fi >= myq[q-1] & fi < myq[q]])
+    }
+    
+    df_list[[mynam]] <- data.frame(patient_id, ag, fi) # raw FI values
+    df_quantile_list[[mynam]] <- data.frame(patient_id, ag, quantile = names(myq), fi = myq) # FI quantiles
+    df_bin_list[[mynam]] <- data.frame(patient_id, ag, quantile = names(myq_bin), fi = myq_bin)     
+
+  }
+}
+
+df_list <- df_list[unlist(lapply(df_list, ncol)) == 3] 
+df_quantile_list <- df_quantile_list[unlist(lapply(df_quantile_list, ncol)) == 4] 
+
+# raw FIs
+fi_df <- do.call("rbind", df_list)
+
+fi_quant_df <- do.call("rbind", df_quantile_list) %>%
+  dplyr::mutate(time = ifelse(grepl("D$", patient_id), "Diagnosis", "Relapse"),
+                patient_id = gsub("-.*", "", patient_id),
+                patient_id = gsub(" ", "_", patient_id),
+                patient_id = paste(patient_id, time, sep = "_")) %>%
+  dplyr::select(-time)
+
+fi_mean_df <- do.call("rbind", df_bin_list) %>%
+  dplyr::mutate(time = ifelse(grepl("D$", patient_id), "Diagnosis", "Relapse"),
+                patient_id = gsub("-.*", "", patient_id),
+                patient_id = gsub(" ", "_", patient_id),
+                patient_id = paste(patient_id, time, sep = "_")) %>%
+  dplyr::select(-time)
+
+
+# add CD45 flow data (only available for 4 patient samples)
+cd45_flow_paths <- c("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/CD45_43-6D/export_B2 CD45 HI30_Blast.fcs",
+                    "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/CD45_43-6R/export_CD45 HI30_Blast.fcs",
+                    "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/CD45_70-6D/export_D2 CD45 HI30_Blast.fcs",
+                    "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/CD45_70-6R/export_E2 CD45 HI30_Blast.fcs")
+
+
+cd45_flow_list <- lapply(cd45_flow_paths, 
+                         function(object_path) aws.s3::s3read_using(FUN = flowCore::read.FCS, 
+                                                                    transformation = FALSE, 
+                                                                    truncate_max_range = TRUE, 
+                                                                    object = object_path))
+
+mynam <- gsub("export.*", "", cd45_flow_paths)
+mynam <- gsub("CD45_", "Patient_", basename(mynam))
+mynam <- gsub("-6D", "_Diagnosis", mynam)
+mynam <- gsub("-6R", "_Relapse", mynam)
+names(cd45_flow_list) <- mynam
+
+cd45_flow_list <- lapply(cd45_flow_list, function(arg) flowCore::transform(arg, `PE-A` = asinh(`PE-A`)))
+cd45_flow_list <- lapply(cd45_flow_list, function(arg) exprs(arg)[, "PE-A"])
+cd45_flow_list <- lapply(cd45_flow_list, function(arg) {
+  tmp <- quantile(arg, probs = seq(0, 1, myprobs), na.rm = TRUE) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("quantile") %>%
+    dplyr::rename(fi = ".") %>%
+    dplyr::mutate(ag = "CD45")
+  return(tmp)
+  
+})
+fi_quant_df_cd45 <- dplyr::bind_rows(cd45_flow_list, .id = "patient_id")
+fi_quant_df <- dplyr::bind_rows(fi_quant_df, fi_quant_df_cd45)
+
+# quantile normalize DSB values
+
+# class-specific normalization
+# qn_data <- lapply(unique(blast_object$sample_id), function(myid) {
+#   tmp_obj <- dplyr::filter(blast_object, sample_id %in% myid)
+#   limma::normalizeQuantiles(tmp_obj@assays$ADT_dsb@data)
+# })
+# qn_data <- do.call("cbind", qn_data)
+
+# whole dataset normalization
+qn_data <- limma::normalizeQuantiles(blast_object@assays$ADT_dsb_ebayes@data)
+blast_object[["ADT_qn"]] <- CreateAssayObject(data = qn_data)
+
+blast_df <- blast_object@assays$ADT_dsb_ebayes@data[rownames(blast_object@assays$ADT) %in% c("CD33", "CLL1", "EMR2", "CD123", "CD45"), ]
+# DefaultAssay(blast_object) <- "RNA"
+# blast_df <- FetchData(blast_object, vars = c("CD33", "CLEC12A", "ADGRE2", "IL3RA", "PTPRC"), layer = "data")
+# colnames(blast_df) <- c("CD33", "CLL1", "EMR2", "CD123", "CD45")
+blast_df <- t(blast_df)
+
+blast_list <- blast_df %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::mutate(patient_id = gsub(".*-", "", cell)) %>%
+  dplyr::select(-cell) %>%
+  tidyr::pivot_longer(-patient_id, names_to = "ag", values_to = "fi") %>%
+  dplyr::group_split(patient_id, ag)
+
+blast_list <- lapply(blast_list, function(arg) {
+  
+  myq <- quantile(arg$fi, probs = seq(0, 1, myprobs))
+  #myq <- mean(arg$fi)
+  mydf <- data.frame(patient_id = arg$patient_id[1], ag = arg$ag[1], quantile = names(myq), fi = myq)
+  return(mydf)
+  
+})
+
+blast_df <- do.call("rbind", blast_list)
+
+fi_comdata <- dplyr::right_join(fi_quant_df, blast_df, 
+                                by = c("patient_id", "ag", "quantile"), 
+                                suffix = c("_flow", "_adt")) 
+#%>%
+  #dplyr::filter(grepl("Patient_70|Patient_43", patient_id))
+
+
+# plot quantiles
+trim_data_quantiles <- dplyr::filter(
+  fi_comdata, 
+  !is.na(fi_flow)
+)
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "fi_adt",
+                  y = "fi_flow",
+                  facet.by = "patient_id",
+                  color = "ag",
+                  xlab = glue::glue("DSB normalized ADT quantiles ({myprobs})"),
+                  ylab = glue::glue("log fluorescent intensity quantiles ({myprobs})"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 2),
+                  size = 0.4,
+                  palette = "lancet") + 
+  geom_hline(yintercept = 3.25, lty = 2)
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "fi_adt",
+                  y = "fi_flow",
+                  color = "ag",
+                  ylim = c(0, 12),
+                  facet.by = "patient_id",
+                  xlab = glue::glue("Median DSB normalized ADT"),
+                  ylab = glue::glue("Median log fluorescent intensity"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 2),
+                  size = 1.5,
+                  palette = "lancet")
+
+
+# plot quantiles for CD33 across samples
+trim_data_quantiles <- dplyr::filter(
+  fi_comdata, 
+  !is.na(fi_flow)
+)
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "fi_adt",
+                  y = "fi_flow",
+                  #ylim = c(0, 12),
+                  color = "ag",
+                  #facet.by = "patient_id",
+                  xlab = glue::glue("DSB normalized ADT quantiles ({myprobs})"),
+                  ylab = glue::glue("log fluorescent intensity quantiles ({myprobs})"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 6),
+                  size = 1.5,
+                  legend = "none")
+
+# plot median ag expression
+trim_data_median <- dplyr::filter(
+  fi_comdata, 
+  quantile %in% c("50%"),
+  !is.na(fi_flow)
+)
+
+ggpubr::ggscatter(data = trim_data_median,
+                  x = "fi_adt",
+                  y = "fi_flow",
+                  xlab = glue::glue("Median asinh DSB normalized ADT"),
+                  ylab = glue::glue("Median asinh fluorescent intensity"),
+                  face.by = "ag",
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 4),
+                  size = 1.5,
+                  palette = "lancet",
+                  add = "reg.line")
+
+ggpubr::ggscatter(data = trim_data_median,
+                  x = "fi_adt",
+                  y = "fi_flow",
+                  color = "ag",
+                  facet.by = "patient_id",
+                  xlab = glue::glue("Median DSB normalized ADT"),
+                  ylab = glue::glue("Median asinh fluorescent intensity"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 2.5),
+                  size = 3,
+                  palette = "lancet")
+
+
+```
+
+
+# Convert FI to antigen density using QuantiBRITE standard curve
+```{r fi_vs_quantibrite}
+
+qb_levels <- data.frame(peak = as.factor(1:4), ag_density = c(474, 5359, 23843, 62336))
+
+plot_list <- lapply(names(flow_list_qb), function(arg) {
+  data.frame(fcs_file = arg,
+             PE = exprs(flow_list_qb[[arg]])[, "PE-A"])
+})
+names(plot_list) <- names(flow_list_qb)
+plot_list <- plot_list[!names(plot_list) %in% "patients_47_48/export_A12 Quantibrite_beads"]
+plot_df <- do.call("rbind", plot_list) %>%
+  dplyr::mutate(fcs_file = gsub("\\/export.*", "", fcs_file))
+
+rownames(plot_df) <- NULL
+
+gghistogram(data = plot_df,
+            x = "PE",
+            xlim = c(0, 20),
+            fill = "fcs_file",
+            color = "white",
+            bins = 100,
+            legend = "right",
+            palette = "simpsons")
+
+ggdensity(data = plot_df,
+          x = "PE",
+          xlim = c(5, 18),
+          xlab = "asinh PE FI",
+          color = "fcs_file",
+          legend = "right",
+          palette = "lancet")
+
+
+# compute PE peak means for each sample
+set.seed(465012)
+sample_qb_mean <- lapply(names(plot_list), function(arg) {
+  
+  mclust_model <- mclust::Mclust(data = plot_list[[arg]]$PE, G = 4)
+  cell_class <- data.frame(FI = plot_list[[arg]]$PE, peak = mclust_model$classification)
+  
+  pe_mean <- sort(mclust_model$parameters$mean, decreasing = FALSE)
+  pe_mean <- data.frame(fcs_file = arg, peak = 1:4, pe_mean = pe_mean)
+  
+  output_df <- dplyr::left_join(cell_class, pe_mean, by = "peak")
+  
+})
+
+# look at mapping between PE and Ag count at single cell level
+plot_df <- do.call("rbind", sample_qb_mean) %>%
+  dplyr::mutate(peak = as.factor(peak)) %>%
+  dplyr::left_join(qb_levels, by = "peak") %>%
+  dplyr::mutate(fcs_file = gsub("\\/export.*", "", fcs_file),
+                fcs_file = dplyr::case_when(fcs_file == "patients_26_27_28_29" ~ "P01, P12, P18, P24",
+                                            fcs_file == "patients_30_31_67_70" ~ "P04, P06, P08, P19",
+                                            fcs_file == "patients_40_41" ~ "P13, P25",
+                                            fcs_file == "patients_49_50" ~ "P14, P16",
+                                            fcs_file == "patients_4_42_43_44" ~ "P02, P07, P20, P26",
+                                            fcs_file == "patients_51_52_54_56" ~ "P03, P10, P11, P15",
+                                            fcs_file == "patients_58_64_65_66" ~ "P09, P17, P21, P23",
+                                            fcs_file == "patients_60_61_62_63" ~ "P05, P22"))
+
+ggplot(plot_df, aes(x = FI, y = ag_density)) +
+  geom_point(shape = 108, size = 3, alpha = 0.1, aes(color = fcs_file)) +
+  xlim(c(4, 17)) +
+  ylim(c(50, 150000)) +
+  xlab("asinh PE fluorescent intensity") +
+  ylab("QuantiBRITE bead Ag number") +
+  facet_wrap(~fcs_file, ncol = 3) +
+  geom_smooth(se = FALSE, method = "lm", lty = 2, width = 0.05, color = "gray") +
+  scale_y_log10(labels = scales::comma, breaks = c(100, 1000, 10000, 100000)) +
+  scale_color_lancet() +
+  theme_bw() +
+  theme(axis.text = element_text(size = 10))
+
+# keep means
+plot_df <- plot_df %>%
+  dplyr::select(-FI) %>%
+  dplyr::distinct()
+
+ggscatter(data = plot_df,
+          x = "pe_mean",
+          y = "ag_density",
+          ylim = c(50, 100000),
+          xlim = c(8, 15.5),
+          xlab = "Mean asinh PE intensity",
+          ylab = "Log antigen density",
+          color = "fcs_file",
+          legend = "right",
+          palette = "lancet") +
+  scale_y_log10(labels = scales::comma) +
+  geom_abline(slope = 0.4501, intercept = -1.8157, lty = 2) +
+  geom_hline(yintercept = 50, lty = 3) +
+  geom_hline(yintercept = 450, lty = 3)
+
+ggscatter(data = plot_df,
+          x = "pe_mean",
+          y = "ag_density",
+          ylim = c(50, 100000),
+          xlim = c(8, 15.5),
+          xlab = "Mean asinh PE intensity",
+          ylab = "Log antigen density",
+          facet.by = "fcs_file",
+          color = "fcs_file",
+          legend = "right",
+          palette = "lancet",
+          add = "reg.line",
+          add.params = list(linetype = 2, size = 0.1)) +
+  scale_y_log10(labels = scales::comma)
+
+qb_models <- plot_df %>% 
+  dplyr::group_by(fcs_file) %>%
+  dplyr::group_split()
+
+mynam <- sapply(qb_models, function(arg) unique(arg$fcs_file))
+qb_models <- lapply(qb_models, function(arg) lm(log10(ag_density) ~ pe_mean, data = arg))
+names(qb_models) <- mynam
+
+aggr_qb_model <- lm(log10(ag_density) ~ pe_mean, data = plot_df)
+
+```
+
+# Compare ADT and ABC quantiles
+## Calculate FMO Ag density boundaries for all samples
+```{r fmo_ag_density}
+
+fmo_boundary <- NULL
+for (mynam in names(flow_list_fmo)) {
+    
+    model_id <- gsub("\\/.*", "", mynam)
+    fcs_file <- gsub("\\/.*", "", mynam)
+    fi <- exprs(flow_list_fmo[[mynam]])
+    fi <- fi[, colnames(fi) %in% "PE-A"]
+    
+    abc_model <- qb_models[[model_id]]
+    abc <- predict(object = abc_model, newdata = data.frame(pe_mean = fi))
+    abc <- 10^abc
+    upper_boundary <- mean(abc) + 3*sd(abc)
+    patient_id <- gsub("patients_", "", fcs_file)
+    patient_id <- unlist(strsplit(patient_id, split = "_"))
+    patient_id <- paste0("Patient_", patient_id)
+    
+    fmo_boundary[[fcs_file]] <- data.frame(fcs_file = fcs_file, patient = patient_id, fmo_ag_density_boundary = upper_boundary)
+    
+}
+
+fmo_df <- do.call("rbind", fmo_boundary) %>%
+  dplyr::arrange(fmo_ag_density_boundary)
+
+```
+
+## All blasts per sample per antigen
+```{r adt_ag_quantiles_blast, fig.width = 8, fig.height = 7}
+
+flow_list_ags_all_blasts <- flow_list[!grepl("_PE+|Quantibrite|LSC|export|Live", names(flow_list), ignore.case = TRUE)]
+
+file_count <- names(flow_list_ags_all_blasts)
+file_count <- gsub(".*/", "", file_count)
+file_count <- gsub("_.*", "", file_count)
+table(file_count) %>% sort()
+stopifnot(all(table(file_count) == 4))
+
+# compute Ag quantiles
+myprobs <- 0.05
+df_list <- NULL
+df_quantile_list <- NULL
+df_mean_list <- NULL
+df_median_list <- NULL
+for (ag in c("CD33", "CLL1", "CD123", "EMR2")) {
+  
+  flow_list_ags_select <- flow_list_ags_all_blasts[grepl(ag, names(flow_list_ags_all_blasts))]
+
+  for (mynam in names(flow_list_ags_select)) {
+    
+    model_id <- gsub("\\/.*", "", mynam)
+    sample_id <- gsub(".*\\/", "", mynam)
+    sample_id <- gsub("_.*", "", sample_id)
+    
+    # extract FIs from flowCore object
+    fluor <- flow_list_ags_select[[mynam]]@parameters@data
+    fluor <- as.character(fluor$name[fluor$desc %in% ag])
+    if (length(fluor) == 0) fluor = "PE-A"
+    fi <- exprs(flow_list_ags_select[[mynam]])
+    fi <- fi[, colnames(fi) %in% fluor]
+    
+    abc_model <- qb_models[[model_id]]
+    abc <- predict(object = abc_model, newdata = data.frame(pe_mean = fi))
+    
+    if (length(abc) == 0) next
+    
+    # remove negative cells
+    #abc <- abc[abc > 1]
+    # compute quantiles
+    # myclip <- quantile(abc, probs = c(0.1, 0.99))
+    # abc <- abc[abc > myclip[1] & abc < myclip[2]]
+    myq <- quantile(abc, probs = seq(0, 1, myprobs), na.rm = TRUE)
+    df_list[[mynam]] <- data.frame(sample_id, ag, abc) # raw FI values
+    df_quantile_list[[mynam]] <- data.frame(sample_id, ag, quantile = names(myq), abc = myq) # ABC quantiles
+    df_median_list[[mynam]] <- data.frame(sample_id, ag, quantile = "50%", abc = median(abc))
+    
+    # quantile-binned averages
+    myq_bin <- NULL
+    for (q in 2:length(myq)) {
+      myq_bin[paste0("bin_", q-1)] <- mean(abc[abc >= myq[q-1] & abc < myq[q]])
+    }
+      
+    df_mean_list[[mynam]] <- data.frame(sample_id, ag, quantile_bin = names(myq_bin), abc = myq_bin) 
+
+  }
+}
+
+# raw FIs
+fi_df <- do.call("rbind", df_list)
+
+fi_quant_df <- do.call("rbind", df_quantile_list) %>%
+  dplyr::mutate(time = ifelse(grepl("D$", sample_id), "Diagnosis", "Relapse"),
+                sample_id = gsub("-.*", "", sample_id),
+                sample_id = gsub(" ", "_", sample_id),
+                sample_id = paste(sample_id, time, sep = "_")) %>%
+  dplyr::select(-time)
+
+# quantile normalize adt expression for input into machine learning model
+qn_data <- blast_object@assays$ADT_dsb_ebayes@data
+qn_data <- limma::normalizeQuantiles(qn_data)
+blast_object[["ADT_qn"]] <- CreateAssayObject(data = qn_data)
+
+blast_df <- blast_object@assays$ADT_qn@data[rownames(blast_object@assays$ADT_qn) %in% c("CD33", "CLL1", "EMR2", "CD123"), ]
+blast_df <- t(blast_df)
+
+blast_list <- blast_df %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", cell)) %>%
+  dplyr::select(-cell) %>%
+  tidyr::pivot_longer(-sample_id, names_to = "ag", values_to = "abc") %>%
+  dplyr::group_split(sample_id, ag)
+
+blast_list <- lapply(blast_list, function(arg) {
+  
+  adt_abc <- arg$abc
+  myq <- quantile(adt_abc, probs = seq(0, 1, myprobs))
+  mydf <- data.frame(sample_id = arg$sample_id[1], ag = arg$ag[1], quantile = names(myq), abc = myq)
+  return(mydf)
+  
+})
+
+blast_quantiles_df <- do.call("rbind", blast_list)
+
+fi_comdata <- dplyr::right_join(fi_quant_df, blast_quantiles_df, 
+                                by = c("sample_id", "ag", "quantile"), 
+                                suffix = c("_flow", "_adt")) %>%
+  dplyr::mutate(quantile = factor(quantile, levels = unique(.$quantile))) %>% 
+  dplyr::mutate(ag_density = 10^abc_flow,
+                ag_density = ifelse(ag_density < 1, 0, ag_density)) %>%
+  # no flow data for samples "Patient_31_Relapse"   "Patient_52_Diagnosis" "Patient_54_Diagnosis" "Patient_61_Relapse" 
+  dplyr::filter(!is.na(abc_flow))
+
+# plot median ag expression
+trim_data_median <- dplyr::filter(fi_comdata, quantile %in% c("50%")) 
+
+ggpubr::ggscatter(data = trim_data_median,
+                  x = "abc_adt",
+                  y = "ag_density",
+                  xlab = glue::glue("DSB normalized ADT"),
+                  ylab = glue::glue("Antigen density"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 4),
+                  cor.coef.coord = c(-1, 4),
+                  size = 3,
+                  legend = "right") +
+  geom_hline(yintercept = min(fmo_df$fmo_ag_density_boundary), lty = 3) +
+  geom_hline(yintercept = max(fmo_df$fmo_ag_density_boundary), lty = 3) +
+  geom_hline(yintercept = mean(fmo_df$fmo_ag_density_boundary), lty = 2) +
+  scale_y_log10(breaks = c(1, 10, 100, 1000, 10000, 100000), labels = c("1", "10", "100", "1,000", "10,000", "100,000")) +
+  scale_x_continuous(breaks = -1:15) +
+  geom_vline(xintercept = 0, lty = 3) +
+  geom_smooth(method = "lm")
+
+ggpubr::ggscatter(data = trim_data_median,
+                  x = "abc_adt",
+                  y = "abc_flow",
+                  xlab = glue::glue("Median asinh DSB normalized ADT"),
+                  ylab = glue::glue("Median log10 antigen density"),
+                  facet.by = "sample_id",
+                  color = "ag",
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 2),
+                  size = 1.5,
+                  palette = "lancet")
+
+# plot quantiles across samples
+trim_data_quantiles <- fi_comdata %>%
+  dplyr::mutate(patient = gsub("_Diagnosis|_Relapse", "", sample_id)) %>%
+  dplyr::left_join(fmo_df, by = "patient") %>%
+  # dplyr::mutate(ag = case_when(ag %in% "EMR2" ~ "ADGRE2",
+  #                              ag %in% "CLL1" ~ "CLL-1",
+  #                              TRUE ~ ag)) %>%
+  dplyr::mutate(ag = factor(ag, levels = c("CD33", "CLL1", "CD123", "EMR2")),
+                quantile_group = ifelse(!quantile %in% c("0%", "5%", "10%"), ">10%", as.character(quantile)),
+                #quantile_group = ifelse(quantile_group == "0%", ">1%", quantile_group),
+                quantile_group = factor(quantile_group, levels = c(">10%", "10%", "5%", "0%")))
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "abc_adt",
+                  y = "abc_flow",
+                  color = "ag",
+                  xlab = glue::glue("DSB normalized ADT quantiles ({myprobs})"),
+                  ylab = glue::glue("log10 antigen density quantiles ({myprobs})"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  facet.by = "ag",
+                  cor.coeff.args = list(size = 2),
+                  size = 1.5)
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "abc_adt",
+                  y = "ag_density",
+                  alpha = 0.3,
+                  color = "sample_id",
+                  xlab = glue::glue("Normalized ADT"),
+                  ylab = glue::glue("Antigen density"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 4),
+                  size = 2,
+                  legend = "none",
+                  facet.by = "ag") +
+  geom_hline(yintercept = min(fmo_df$fmo_ag_density_boundary), lty = 3) +
+  geom_hline(yintercept = max(fmo_df$fmo_ag_density_boundary), lty = 3) +
+  geom_hline(yintercept = mean(fmo_df$fmo_ag_density_boundary), lty = 1) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10),
+                     breaks = c(0, 1, 10, 100, 1000, 10000, 100000), 
+                     labels = c("0", "1", "10", "100", "1,000", "10,000", "100,000")) +
+  scale_x_continuous(breaks = seq(-1, 20, 2)) +
+  geom_vline(xintercept = 0, lty = 3) +
+  stat_density_2d(alpha = 0.3, color = "black") +
+  geom_smooth(se = FALSE)
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "abc_adt",
+                  y = "ag_density",
+                  alpha = 0.3,
+                  color = "quantile_group",
+                  xlab = glue::glue("Normalized ADT"),
+                  ylab = glue::glue("Antigen density"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 4),
+                  #cor.coef.coord = c(-1.1, 10000),
+                  size = 2,
+                  legend = "right",
+                  facet.by = "ag",
+                  palette = c("aquamarine4", "blue", "orange", "red")) +
+  geom_hline(yintercept = min(fmo_df$fmo_ag_density_boundary), lty = 3) +
+  geom_hline(yintercept = max(fmo_df$fmo_ag_density_boundary), lty = 3) +
+  geom_hline(yintercept = mean(fmo_df$fmo_ag_density_boundary), lty = 1) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10),
+                     breaks = c(0, 1, 10, 100, 1000, 10000, 100000), 
+                     labels = c("0", "1", "10", "100", "1,000", "10,000", "100,000")) +
+  scale_x_continuous(breaks = c(seq(-1, 10, 1), seq(12, 20, 2))) +
+  geom_vline(xintercept = 1, lty = 3) +
+  stat_density_2d(alpha = 0.3, color = "black") +
+  geom_smooth(se = FALSE)
+
+
+ggpubr::ggscatter(data = dplyr::mutate(trim_data_quantiles, 
+                                       ag = factor(case_when(ag == "CLL1" ~ "CLL-1",
+                                                             ag == "EMR2" ~ "ADGRE2",
+                                                             TRUE ~ as.character(ag)), levels = c("CD33", "CLL-1", "CD123", "ADGRE2"))),
+                  x = "abc_adt",
+                  y = "ag_density",
+                  alpha = 0.3,
+                  color = "ag",
+                  facet.by = "ag",
+                  xlab = glue::glue("Normalized ADT"),
+                  ylab = glue::glue("QuantiBRITE antigen number"),
+                  size = 0.1,
+                  legend = "right",
+                  palette = c("skyblue3", "hotpink", "purple", "olivedrab3")) +
+  #geom_hline(yintercept = mean(fmo_df$fmo_ag_density_boundary), lty = 1) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10),
+                     breaks = c(0, 10, 100, 1000, 10000, 100000), 
+                     labels = c("0", "10", "100", "1,000", "10,000", "100,000")) +
+  scale_x_continuous(breaks = c(-1, 0, 1, 2, 5, 10, 15, 20)) +
+  #geom_vline(xintercept = 1, lty = 3) +
+  stat_density_2d(alpha = 0.3, color = "black") +
+  geom_smooth(se = TRUE, fill = "gray", colour = "black")
+
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "abc_adt",
+                  y = "abc_flow",
+                  color = "sample_id",
+                  alpha = 0.5,
+                  xlab = glue::glue("DSB normalized ADT"),
+                  ylab = glue::glue("log10 antigen density"),
+                  cor.coef = TRUE,
+                  cor.method = "pearson",
+                  cor.coeff.args = list(size = 2),
+                  size = 1,
+                  legend = "none") +
+  geom_vline(xintercept = 0, lty = 3)
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "abc_adt",
+                  y = "ag_density",
+                  ylim = c(10, 100000),
+                  color = "ag",
+                  facet.by = "sample_id",
+                  xlab = glue::glue("Normalized ADT"),
+                  ylab = glue::glue("Antigen density"),
+                  cor.coef = FALSE,
+                  cor.method = "spearman",
+                  cor.coeff.args = list(size = 2),
+                  size = 0.4) +
+  scale_y_log10(breaks = c(10, 100, 1000, 10000, 100000), labels = c("10", "100", "1,000", "10,000", "100,000"))
+
+ggpubr::ggscatter(data = dplyr::filter(trim_data_quantiles, sample_id %in% c("Patient_26_Diagnosis", "Patient_26_Relapse", "Patient_40_Relapse", "Patient_41_Relapse")),
+                  x = "abc_adt",
+                  y = "ag_density",
+                  color = "ag",
+                  facet.by = "sample_id",
+                  xlab = glue::glue("DSB normalized ADT"),
+                  ylab = glue::glue("log10 antigen density"),
+                  cor.coef = TRUE,
+                  cor.method = "spearman",
+                  cor.coeff.args = list(size = 2),
+                  size = 3) +
+  geom_vline(xintercept = 0, lty = 3) + 
+  scale_y_log10()
+
+summary(lm(abc_flow ~ abc_adt, data = trim_data_median))
+summary(lm(abc_flow ~ abc_adt, data = trim_data_quantiles))
+
+
+```
+
+# Fit model and estimate ABCs for all antigens in blasts
+## Use sample-feature quantiles
+```{r predict_ag_using_quantiles_as_training_data, fig.height = 9, fig.width = 10}
+
+ab_data <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_atlas_sample_metadata.csv") %>%
+  dplyr::select(sample_id, contains("antibody")) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate_at(vars(contains("antibody")), .funs = as.numeric)
+
+training_data <- trim_data_quantiles %>%
+  dplyr::left_join(ab_data, by = "sample_id") %>%
+  dplyr::mutate(patient = gsub("_Diagnosis|_Relapse", "", sample_id))
+
+training_data_for_model <- dplyr::filter(training_data, ag %in% c("CD33", "CLL1", "EMR2", "CD123")) %>%
+  dplyr::select(-fcs_file, -patient, -sample_id, -ag, -quantile, -quantile_group, -ag_density, -fmo_ag_density_boundary)
+
+stopifnot(all(complete.cases(training_data_for_model)))
+
+# train model
+set.seed(391622) 
+fitControl <- caret::trainControl(method = "repeatedcv", number = 10, repeats = 10)
+mymethod <- "rf"
+gbmFit1 <- caret::train(
+  
+  abc_flow ~ .,
+  data = training_data_for_model,
+  method = mymethod,
+  trControl = fitControl,
+  verbose = FALSE
+
+)
+
+gbmFit1
+
+input_data <- blast_object@assays$ADT_qn@data %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("barcode") %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", barcode)) %>%
+  dplyr::left_join(ab_data, by = "sample_id") %>%
+  dplyr::mutate(patient = gsub(".*-|_Diagnosis|_Relapse", "", barcode)) %>%
+  dplyr::left_join(fmo_df, by = "patient")
+
+input_data <- input_data[complete.cases(input_data), ]
+myfeats <- rownames(blast_object@assays$ADT_qn@data)
+
+# save copy of model
+sample_data <- dplyr::select(input_data, sample_id, CD33, contains("antibody")) %>%
+  dplyr::rename(abc_adt = CD33)
+sample_data <- sample_data[sample(1:nrow(input_data), 100, replace = FALSE), ]
+rownames(sample_data) <- paste0("blast_", 1:nrow(sample_data))
+
+# predict antigen density
+mypred <- predict(gbmFit1, newdata = sample_data)
+mypred <- 10^mypred
+ag_density_prediction_model <- list(rf_model = gbmFit1, sample_test_data_CD33 = sample_data, predicted_ag_density = data.frame(CD33_estimated_ag_density = mypred, sample_data))
+
+aws.s3::s3saveRDS(x = ag_density_prediction_model,
+                  object = glue::glue("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/antigen_density_prediction_models/{mymethod}_model_{Sys.Date()}.rds"))
+
+tic()
+
+# load pre-trained model
+#mymodel <- aws.s3::s3readRDS(object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/antigen_density_prediction_models/rf_model_2024-09-24_ASH_2024_poster.rds")[[1]]
+mymodel <- gbmFit1
+imputed_abc <- foreach(arg = myfeats, .combine = "cbind", .inorder = TRUE, .packages = c("randomForest", "e1071",  "dplyr", "caret")) %dopar% {
+  
+  newdata <- dplyr::select(input_data, all_of(arg), contains("antibody"))
+  colnames(newdata)[colnames(newdata) == arg] <- "abc_adt"
+  mypred <- predict(mymodel, newdata = newdata)
+  mypred <- 10^mypred
+  mypred <- data.frame(mypred)
+  colnames(mypred) <- arg
+  gc()
+  return(mypred)
+  
+}
+toc()
+rownames(imputed_abc) <- input_data$barcode
+
+aws.s3::s3write_using(imputed_abc, 
+                      FUN = write.csv, 
+                      object = glue::glue("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/imputed_ag_density/imputed_ag_density_blasts_{Sys.Date()}.csv"))
+
+#sanity checks
+iso_df <- dplyr::select(input_data, starts_with("ISOTYPE"))
+iso_df <- data.frame(ADT_type = "Isotype control", mean_ag = rowMeans(iso_df))
+
+myeloid_df  <- dplyr::select(input_data, !starts_with("ISOTYPE"))
+myeloid_df <- data.frame(ADT_type = "Myeloid antibody", mean_ag = rowMeans(myeloid_df[, c("CD33", "CLL1", "CD123", "EMR2")]))
+
+lym_df  <- dplyr::select(input_data, !starts_with("ISOTYPE"))
+lym_df <- data.frame(ADT_type = "Lymphoid antibody", mean_ag = rowMeans(lym_df[, colnames(lym_df) %in% c("CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+ab_df  <- dplyr::select(input_data, !starts_with("ISOTYPE")) %>%
+  dplyr::select(!starts_with("antibody"), -sample_id, -barcode, -patient, -fcs_file, -fmo_ag_density_boundary)
+ab_df <- data.frame(ADT_type = "Other antibody", mean_ag = rowMeans(ab_df[, !colnames(ab_df) %in% c("CD33", "CLL1", "CD123", "EMR2", "CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+sanity_data <- bind_rows(myeloid_df, lym_df, ab_df, iso_df) %>%
+  dplyr::filter(!is.na(mean_ag)) %>%
+  dplyr::mutate(ADT_type = factor(ADT_type, levels = c("Myeloid antibody", "Lymphoid antibody", "Other antibody", "Isotype control")))
+
+gghistogram(sanity_data, 
+            x = "mean_ag", 
+            xlab = "Average normalized ADT",
+            ylab = "Number of cells",
+            xlim = c(-1, 10),
+            fill = "ADT_type", 
+            color = "white", 
+            bins = 100,
+            palette = c("cornflowerblue", "forestgreen", "purple", "black"))
+
+iso_df <- dplyr::select(imputed_abc, starts_with("ISOTYPE"))
+iso_df <- data.frame(ADT_type = "Isotype control", mean_ag = rowMeans(iso_df))
+
+myeloid_df  <- dplyr::select(imputed_abc, !starts_with("ISOTYPE"))
+myeloid_df <- data.frame(ADT_type = "Myeloid antibody", mean_ag = rowMeans(myeloid_df[, c("CD33", "CLL1", "CD123", "EMR2")]))
+
+lym_df  <- dplyr::select(imputed_abc, !starts_with("ISOTYPE"))
+lym_df <- data.frame(ADT_type = "Lymphoid antibody", mean_ag = rowMeans(lym_df[, colnames(lym_df) %in% c("CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+ab_df  <- dplyr::select(imputed_abc, !starts_with("ISOTYPE"))
+ab_df <- data.frame(ADT_type = "Other antibody", mean_ag = rowMeans(ab_df[, !colnames(ab_df) %in% c("CD33", "CLL1", "CD123", "EMR2", "CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+sanity_data <- bind_rows(myeloid_df, lym_df, ab_df, iso_df) %>%
+  dplyr::filter(!is.na(mean_ag)) %>%
+  dplyr::mutate(ADT_type = factor(ADT_type, levels = c("Myeloid antibody", "Lymphoid antibody", "Other antibody", "Isotype control")))
+
+gghistogram(sanity_data, 
+            x = "mean_ag", 
+            xlab = "Average predicted antigen density",
+            ylab = "Number of cells",
+            xlim = c(0, 10000),
+            fill = "ADT_type", 
+            color = "white", 
+            bins = 200,
+            palette = c("cornflowerblue", "forestgreen", "purple", "black")) +
+  geom_vline(xintercept = 500, lty = 2)
+
+cd33_df  <- dplyr::select(imputed_abc, "CD33")
+
+gghistogram(cd33_df, 
+            x = "CD33", 
+            main = "Blasts",
+            xlab = "Esimated # of CD33 Ags",
+            ylab = "Number of cells",
+            #xlim = c(0, 60000),
+            fill = "blue", 
+            bins = 50) +
+  geom_vline(xintercept = 500, lty = 2)
+
+# Compare estimated Ag+ rate with flow + FMO
+imputed_abc_coverage <- calculate_coverage(imputed_abc_df = imputed_abc, 
+                                           fmo_threshold_df = fmo_df, 
+                                           first_antigen = "CD33", 
+                                           second_antigen = "CLL1") %>%
+  tidyr::unite("sample_id", patient, time)
+
+bpos_df <- aws.s3::s3read_using(readr::read_csv,
+                                object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/percent_positive_blasts.csv") %>%
+  dplyr::mutate(time = ifelse(grepl("D$", vor_patient_id), "Diagnosis", "Relapse"),
+                patient = paste0("Patient_", gsub("-.*", "", vor_patient_id))) %>%
+  dplyr::select(patient, time, everything()) %>%
+  dplyr::select(-vor_patient_id) %>%
+  tidyr::pivot_longer(cols = c(CD33, CD123, CLL1, EMR2), values_to = "percent_positive_blast", names_to = "adt") %>%
+  tidyr::unite(col = "sample_id", patient, time)
+
+bpos_df_wide <- tidyr::pivot_wider(bpos_df, names_from = "adt", values_from = "percent_positive_blast")
+
+compare_df <- dplyr::left_join(imputed_abc_coverage, bpos_df_wide, by = "sample_id") %>%
+  dplyr::rename(percent_cd33 = percent_first_ag, percent_cll1 = percent_second_ag)
+
+p_cd33 <- ggpubr::ggscatter(data = compare_df,
+                  main = "% CD33+ blasts",
+                  x = "percent_cd33",
+                  y = "CD33",
+                  xlim = c(1, 100),
+                  ylim = c(1, 100),
+                  xlab = "Predicted % positive",
+                  ylab = "Flow % positive",
+                  repel = TRUE,
+                  cor.coef = TRUE) +
+  geom_abline(intercept = 0, slope = 1, lty = 2)
+
+p_cll1 <- ggpubr::ggscatter(data = compare_df,
+                  main = "% CLL-1 blasts", 
+                  x = "percent_cll1",
+                  y = "CLL1",
+                  xlim = c(1, 100),
+                  ylim = c(1, 100),
+                  xlab = "Predicted % positive",
+                  ylab = "Flow % positive",
+                  repel = TRUE,
+                  cor.coef = TRUE) +
+  geom_abline(intercept = 0, slope = 1, lty = 2)
+
+# CD123 and EMR2
+imputed_abc_coverage <- calculate_coverage(imputed_abc_df = imputed_abc, 
+                                           fmo_threshold_df = fmo_df, 
+                                           first_antigen = "CD123", 
+                                           second_antigen = "EMR2") %>%
+  tidyr::unite("sample_id", patient, time)
+
+bpos_df_wide <- tidyr::pivot_wider(bpos_df, names_from = "adt", values_from = "percent_positive_blast")
+
+compare_df <- dplyr::left_join(imputed_abc_coverage, bpos_df_wide, by = "sample_id") %>%
+  dplyr::rename(percent_cd123 = percent_first_ag, percent_emr2 = percent_second_ag)
+
+p_cd123 <- ggpubr::ggscatter(data = compare_df,
+                  main = "% CD123+ blasts", 
+                  x = "percent_cd123",
+                  y = "CD123",
+                  xlim = c(1, 100),
+                  ylim = c(1, 100),
+                  xlab = "Predicted % positive",
+                  ylab = "Flow % positive",
+                  repel = TRUE,
+                  cor.coef = TRUE,
+                  cor.coef.coord = c(0, 90)) +
+  geom_abline(intercept = 0, slope = 1, lty = 2)
+
+p_emr2 <- ggpubr::ggscatter(data = compare_df,
+                  main = "% ADGRE2+ blasts", 
+                  x = "percent_emr2",
+                  y = "EMR2",
+                  xlim = c(1, 100),
+                  ylim = c(1, 100),
+                  xlab = "Predicted % positive",
+                  ylab = "Flow % positive",
+                  repel = TRUE,
+                  cor.coef = TRUE,
+                  cor.coef.coord = c(0, 90)) +
+  geom_abline(intercept = 0, slope = 1, lty = 2)
+
+
+(p_cd33 + p_cll1) / (p_cd123 + p_emr2)
+
+
+```
+
+## Leave one antigen out analysis
+```{r leave_one_ag_out_analysis}
+
+ags <- c("CD33", "CLL1", "EMR2", "CD123", "control")
+plot_list <- list()
+imputed_abc_ag_out_list <- list()
+set.seed(38347)  
+for (ag_out in ags) {
+  
+  training_data_for_model <- dplyr::filter(training_data, !(ag %in% c(ag_out))) %>%
+    dplyr::select(-fcs_file, -patient, -sample_id, -ag, -quantile, -quantile_group, -ag_density, -fmo_ag_density_boundary)
+  
+  stopifnot(all(complete.cases(training_data_for_model)))
+  
+  # Random forests
+  set.seed(85630)                                                         
+  fitControl <- caret::trainControl(method = "repeatedcv",
+                                    number = 10,
+                                    ## repeated ten times
+                                    repeats = 10)
+  
+  mymethod <- "rf"
+  gbmFit1 <- caret::train(abc_flow ~ .,
+                          data = training_data_for_model,
+                          method = mymethod,
+                          trControl = fitControl,
+                          verbose = FALSE)
+  
+  # fit model
+  tic()
+  imputed_abc_ag_out <- foreach(arg = myfeats, .combine = "cbind", .inorder = TRUE, .packages = c("randomForest", "e1071",  "dplyr", "caret")) %dopar% {
+    
+    newdata <- dplyr::select(input_data, all_of(arg), contains("antibody"))
+    colnames(newdata)[colnames(newdata) == arg] <- "abc_adt"
+    mypred <- predict(gbmFit1, newdata = newdata)
+    mypred <- 10^mypred
+    mypred <- data.frame(mypred)
+    colnames(mypred) <- arg
+    gc()
+    return(mypred)
+    
+  }
+  toc()
+  rownames(imputed_abc_ag_out) <- input_data$barcode
+  
+  imputed_abc_ag_out_list[[ag_out]] <- imputed_abc_ag_out
+  
+  # Compare estimated Ag+ rate with flow + FMO
+  imputed_abc_ag_out_coverage <- calculate_coverage(imputed_abc_df = imputed_abc_ag_out, 
+                                                    fmo_threshold_df = fmo_df, 
+                                                    first_antigen = "CD33", 
+                                                    second_antigen = "CLL1") %>%
+    tidyr::unite("sample_id", patient, time)
+  
+  compare_df <- dplyr::left_join(imputed_abc_ag_out_coverage, bpos_df_wide, by = "sample_id") %>%
+    dplyr::rename(percent_cd33 = percent_first_ag, percent_cll1 = percent_second_ag)
+  
+  p_cd33 <- ggpubr::ggscatter(data = compare_df,
+                    main = "% CD33+ blasts",
+                    x = "percent_cd33",
+                    y = "CD33",
+                    xlim = c(1, 100),
+                    ylim = c(1, 100),
+                    xlab = "Predicted % positive",
+                    ylab = "Flow % positive",
+                    repel = TRUE,
+                    cor.coef = TRUE) +
+    geom_abline(intercept = 0, slope = 1, lty = 2)
+  
+  p_cll1 <- ggpubr::ggscatter(data = compare_df,
+                    main = "% CLL-1 blasts", 
+                    x = "percent_cll1",
+                    y = "CLL1",
+                    xlim = c(1, 100),
+                    ylim = c(1, 100),
+                    xlab = "Predicted % positive",
+                    ylab = "Flow % positive",
+                    repel = TRUE,
+                    cor.coef = TRUE) +
+    geom_abline(intercept = 0, slope = 1, lty = 2)
+  
+  # CD123 and EMR2
+  imputed_abc_coverage <- calculate_coverage(imputed_abc_df = imputed_abc, 
+                                             fmo_threshold_df = fmo_df, 
+                                             first_antigen = "CD123", 
+                                             second_antigen = "EMR2") %>%
+    tidyr::unite("sample_id", patient, time)
+  
+  bpos_df_wide <- tidyr::pivot_wider(bpos_df, names_from = "adt", values_from = "percent_positive_blast")
+  
+  compare_df <- dplyr::left_join(imputed_abc_coverage, bpos_df_wide, by = "sample_id") %>%
+    dplyr::rename(percent_cd123 = percent_first_ag, percent_emr2 = percent_second_ag)
+  
+  p_cd123 <- ggpubr::ggscatter(data = compare_df,
+                    main = "% CD123+ blasts", 
+                    x = "percent_cd123",
+                    y = "CD123",
+                    xlim = c(1, 100),
+                    ylim = c(1, 100),
+                    xlab = "Predicted % positive",
+                    ylab = "Flow % positive",
+                    repel = TRUE,
+                    cor.coef = TRUE,
+                    cor.coef.coord = c(0, 90)) +
+    geom_abline(intercept = 0, slope = 1, lty = 2)
+  
+  p_emr2 <- ggpubr::ggscatter(data = compare_df,
+                    main = "% ADGRE2+ blasts", 
+                    x = "percent_emr2",
+                    y = "EMR2",
+                    xlim = c(1, 100),
+                    ylim = c(1, 100),
+                    xlab = "Predicted % positive",
+                    ylab = "Flow % positive",
+                    repel = TRUE,
+                    cor.coef = TRUE,
+                    cor.coef.coord = c(0, 90)) +
+    geom_abline(intercept = 0, slope = 1, lty = 2)
+  
+  if (ag_out == "CD33") {
+    plot_list[[ag_out]] <- p_cd33
+  } else if (ag_out == "CLL1") {
+    plot_list[[ag_out]] <- p_cll1
+  } else if (ag_out == "EMR2") {
+    plot_list[[ag_out]] <- p_emr2
+  } else {
+    plot_list[[ag_out]] <- p_cd123
+  }
+
+}
+
+(plot_list[["CD33"]] + plot_list[["CLL1"]]) / (plot_list[["CD123"]] + plot_list[["EMR2"]])
+
+```
+
+# Compare estimated Ag density with flow
+## Original flow data plots
+```{r compare_estimated_ag_density}
+
+mypath <- "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/20240425_Percent Positivity Matched Blasts Diagnosis vs  Relapse bone marrow .csv"
+flow_ag_data_percent <- aws.s3::s3read_using(readr::read_csv, object = mypath)
+
+colnames(flow_ag_data_percent) <- gsub(" ", "_", colnames(flow_ag_data_percent))
+flow_ag_data_percent <- flow_ag_data_percent %>%
+  dplyr::mutate(patient= paste0("Patient_", patient),) %>%
+  tidyr::pivot_longer(-patient, names_to = "sample", values_to = "flow_antigen_percent_positive") %>%
+  tidyr::separate(sample, c("ag", "timepoint")) %>%
+  dplyr::mutate(ag = factor(ag, levels = c("CD33", "CLL1", "CD123", "EMR2")),
+                timepoint = ifelse(timepoint == "Diagnosis", "Dx", "Re"))
+
+select_pat1 <- dplyr::filter(flow_ag_data_percent, ag == "CD33", timepoint == "Re", flow_antigen_percent_positive < 50)$patient
+select_pat2 <- dplyr::filter(flow_ag_data_percent, ag == "CD33", timepoint == "Dx", flow_antigen_percent_positive < 50)$patient
+select_pat3 <- dplyr::filter(flow_ag_data_percent, ag == "CLL1", timepoint == "Re", flow_antigen_percent_positive > 50)$patient
+select_pat4 <- dplyr::filter(flow_ag_data_percent, ag == "CLL1", timepoint == "Dx", flow_antigen_percent_positive > 50)$patient
+select_pat <- intersect(intersect(intersect(select_pat1, select_pat2), select_pat3), select_pat4)
+
+# flow_ag_data_percent <- flow_ag_data_percent %>%
+#   dplyr::mutate(highlight = factor(ifelse(patient %in% select_pat, "yes", "none"), levels = c("none", "yes")))
+flow_ag_data_percent <- flow_ag_data_percent %>%
+  dplyr::mutate(highlight = factor(ifelse(patient %in% select_pat, patient, "none"), levels = c("none", select_pat)))
+
+ggboxplot(data = flow_ag_data_percent,
+          x = "timepoint",
+          y = "flow_antigen_percent_positive",
+          xlab = "",
+          ylab = "% Antigen+ on AML Blasts",
+          ylim = c(0, 100),
+          color = "black",
+          fill = "white",
+          outlier.shape = NA,
+          legend.position = "none",
+          palette = "lancet") +
+  geom_point(aes(color = ag), position = position_jitter(seed = 42, width = 0.2)) +
+  facet_grid(~ag) +
+  theme_bw() + 
+  theme(legend.position = "none", 
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 17), 
+        strip.text = element_text(size = 15),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        strip.background = element_rect(fill="moccasin")) +
+  scale_y_continuous(labels = c("0%", "25%", "50%", "75%", "100%")) +
+  scale_color_manual(values = c("firebrick2", "cornflowerblue", "mediumorchid1", "seagreen3"))
+
+ggboxplot(data = flow_ag_data_percent,
+          x = "timepoint",
+          y = "flow_antigen_percent_positive",
+          xlab = "",
+          ylab = "% Antigen+ on AML Blasts",
+          ylim = c(0, 100),
+          fill = "white",
+          outlier.shape = NA,
+          legend.position = "none",
+          palette = "jco") +
+  geom_point(aes(color = highlight, alpha = highlight, size = highlight), position = position_jitter(seed = 42, width = 0.2)) +
+  facet_grid(~ag) +
+  theme_bw() + 
+  theme(legend.position = "none", 
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 17), 
+        strip.text = element_text(size = 15),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        strip.background = element_rect(fill="moccasin")) +
+  scale_y_continuous(labels = c("0%", "25%", "50%", "75%", "100%")) +
+  scale_color_manual(values = c("lightgray", "cyan3", "gold1")) +
+  scale_alpha_manual(values = c(0.3, 1, 1)) +
+  scale_size_manual(values = c(1.5, 4, 4))
+
+# ag density
+mypath <- "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/20240425_Antigen Density Matched Blasts Diagnosis vs  Relapse bone marrow .csv"
+flow_ag_data <- aws.s3::s3read_using(readr::read_csv, object = mypath)
+colnames(flow_ag_data) <- gsub(" ", "_", colnames(flow_ag_data))
+flow_ag_data <- flow_ag_data %>%
+  dplyr::mutate(patient = paste0("Patient_", patient),
+                highlight = ifelse(CD33_Relapse < 1000 & CLL1_Relapse > 1000, patient, "none")) %>%
+  tidyr::pivot_longer(-c(patient, highlight), names_to = "sample", values_to = "flow_antigen_density") %>%
+  tidyr::separate(sample, c("ag", "timepoint")) %>%
+  dplyr::mutate(ag = factor(ag, levels = c("CD33", "CLL1", "CD123", "EMR2")))
+
+ggboxplot(data = flow_ag_data,
+          x = "timepoint",
+          y = "flow_antigen_density",
+          xlab = "",
+          ylab = "# of Antigens per Cell (ABC)",
+          ylim = c(100, 100000),
+          color = "black",
+          fill = "white",
+          outlier.shape = NA,
+          legend.position = "none",
+          palette = "lancet") +
+  geom_point(aes(color = ag), position = position_jitter(seed = 42, width = 0.2)) +
+  scale_y_log10(breaks = c(100, 500, 1000, 5000, 10000, 50000),
+                labels = c("100", "500", "1,000", "5,000", "10,000", "50,000")) + 
+  facet_grid(~ag) +
+  theme_bw() + 
+  theme(legend.position = "none", 
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 17), 
+        strip.text = element_text(size = 15),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        strip.background = element_rect(fill="moccasin")) +
+  scale_x_discrete(labels = c("Dx", "Re")) +
+  geom_hline(yintercept = 1000, lty = 2) +
+  scale_color_manual(values = c("firebrick2", "cornflowerblue", "mediumorchid1", "seagreen3"))
+
+
+
+ggboxplot(data = flow_ag_data,
+          x = "timepoint",
+          y = "flow_antigen_density",
+          xlab = "",
+          ylab = "# of Antigens per Cell (ABC)",
+          ylim = c(100, 100000),
+          fill = "white",
+          outlier.shape = NA,
+          legend.position = "none",
+          palette = "lancet") +
+  geom_point(aes(color = highlight, alpha = highlight, size = highlight), position = position_jitter(seed = 42, width = 0.2)) +
+  facet_grid(~ag) +
+  theme_bw() + 
+  scale_y_log10(breaks = c(100, 500, 1000, 5000, 10000, 50000),
+                labels = c("100", "500", "1,000", "5,000", "10,000", "50,000")) + 
+  facet_grid(~ag) +
+  theme_bw() + 
+  theme(legend.position = "right", 
+        axis.text = element_text(size = 15), 
+        axis.title = element_text(size = 17), 
+        strip.text = element_text(size = 15),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        strip.background = element_rect(fill="moccasin")) +
+  scale_x_discrete(labels = c("Dx", "Re")) +
+  geom_hline(yintercept = 1000, lty = 2) +
+  scale_color_manual(values = c("lightgray", "cyan3", "gold1")) +
+  scale_alpha_manual(values = c(0.3, 1, 1)) +
+  scale_size_manual(values = c(1.5, 4, 4))
+
+```
+
+## Assess correlation
+```{r assess_accorrelation} 
+
+abc_estimate <- imputed_abc[, colnames(imputed_abc) %in% c("CD33", "CLL1", "CD123", "EMR2")]
+
+# imputed_abc_ag_out_list <- imputed_abc_ag_out_list[1:4]
+# abc_estimate <- lapply(names(imputed_abc_ag_out_list), function(arg) imputed_abc_ag_out_list[[arg]][, arg, drop = FALSE])
+# abc_estimate <- do.call("cbind", abc_estimate)
+# colnames(abc_estimate) <- names(imputed_abc_ag_out_list)
+
+abc_estimate <- abc_estimate %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("barcode") %>%
+  tidyr::pivot_longer(-barcode, values_to = "estimated_antigen_density", names_to = "ag") %>%
+  dplyr::mutate(patient_id = gsub(".*-", "", barcode),
+                patient_id = gsub("_Diagnosis|_Relapse", "", patient_id),
+                timepoint = gsub(".*_", "", barcode)) %>%
+  dplyr::left_join(fmo_df, by = c("patient_id" = "patient")) %>%
+  dplyr::filter(estimated_antigen_density > fmo_ag_density_boundary) %>% # calculate avg Ag count in Ag+ blasts only
+  dplyr::select(patient_id, timepoint, ag, estimated_antigen_density) %>%
+  dplyr::group_by(patient_id, timepoint, ag) %>%
+  dplyr::summarize(estimated_antigen_density = mean(estimated_antigen_density)) %>%
+  dplyr::ungroup() %>%
+  dplyr::inner_join(flow_ag_data, by = c("patient_id" = "patient", "ag", "timepoint")) %>%
+  tidyr::unite(sample_id, patient_id, timepoint, sep = "_") %>%
+  dplyr::mutate(deviation = abs(estimated_antigen_density - flow_antigen_density)) %>% 
+  dplyr::arrange(desc(deviation)) %>%
+  dplyr::mutate(ag = case_when(ag %in% "EMR2" ~ "ADGRE2",
+                               ag %in% "CLL1" ~ "CLL-1",
+                               TRUE ~ as.character(ag)),
+                ag = factor(ag, levels = c("CD33", "CLL-1", "CD123", "ADGRE2")))
+
+myrange <- c(min(c(abc_estimate$estimated_antigen_density, abc_estimate$flow_antigen_density), na.rm = TRUE), 
+             max(c(abc_estimate$estimated_antigen_density, abc_estimate$flow_antigen_density), na.rm = TRUE))
+
+plotdata <- dplyr::filter(abc_estimate, !is.na(flow_antigen_density))
+ggscatter(data = plotdata,
+          x = "estimated_antigen_density",
+          y = "flow_antigen_density",
+          xlab = "Estimated mean antigen number per blast",
+          ylab = "Measured mean antigen number per blast",
+          xlim = c(100, 100000),
+          ylim = c(100, 100000),
+          facet.by = "ag",
+          color = "ag",
+          cor.coef = TRUE,
+          cor.method = "pearson",
+          #cor.coeff.args = list(p.accuracy = 1e-19),
+          palette = c("skyblue3", "hotpink", "purple", "olivedrab3"),
+          size = 1.4,
+          cor.coef.coord = c(log10(100), log10(65000))
+        ) +
+  scale_x_log10(breaks = c(100, 1000, 10000, 100000), labels = c("100", "1,000", "10,000", "100,000")) + 
+  scale_y_log10(breaks = c(100, 1000, 10000, 100000), labels = c("100", "1,000", "10,000", "100,000")) +
+  geom_abline(slope = 1, intercept = 0, lty = 3) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+test_samples <- blast_data$sample_id[abs(blast_data$residuals) > 25]
+abc_estimate <- dplyr::mutate(abc_estimate,
+                              test_sample = ifelse(sample_id %in% test_samples, "Excluded from model training", "Included in model training"),
+                              test_sample = factor(test_sample, levels = c("Included in model training", "Excluded from model training")))
+
+ggscatter(data = abc_estimate,
+          x = "estimated_antigen_density",
+          y = "flow_antigen_density",
+          xlab = "Estimated Ag density",
+          ylab = "QuantiBRITE Ag density",
+          xlim = myrange,
+          ylim = myrange,
+          facet.by = "test_sample",
+          color = "ag",
+          cor.coef = TRUE,
+          cor.method = "pearson",
+          palette = c("skyblue3", "orchid1", "purple", "olivedrab3"),
+          size = 2
+        ) +
+  scale_x_continuous(breaks = c(1000, 5000, 10000, 15000, 20000)) +
+  geom_abline(slope = 1, intercept = 0, lty = 3) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+abc_estimate_remove_outlier_samples <- dplyr::filter(abc_estimate, !sample_id %in% c("Patient_50_Diagnosis", "Patient_41_Relapse"))
+ggscatter(data = abc_estimate_remove_outlier_samples,
+          x = "estimated_antigen_density",
+          y = "flow_antigen_density",
+          xlab = "Estimated Ag density",
+          ylab = "QuantiBRITE Ag density",
+          xlim = myrange,
+          ylim = myrange,
+          facet.by = "test_sample",
+          color = "ag",
+          cor.coef = TRUE,
+          cor.method = "pearson",
+          palette = c("skyblue3", "orchid1", "purple", "olivedrab3"),
+          size = 2
+        ) +
+  scale_x_continuous(breaks = c(1000, 5000, 10000, 15000, 20000)) +
+  geom_abline(slope = 1, intercept = 0, lty = 3) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+                                                     
+```
+
+# Systematic evaluation of multiplex potential for all possible antigen pairs
+```{r multiplex_potential, width = 17, height = 17}
+
+ag_thr <- 1000
+all_ags <- colnames(imputed_abc)
+all_ags <- all_ags[!grepl("isotype", all_ags, ignore.case = TRUE)]
+all_ags <- all_ags[!all_ags %in% c("CD34", "CD8A", "CD8", "CD19", "CD4", "CD3", "CD44", "CD99", "CD71", "CD93", "CD9", "CD34", "CD47", "CD49F", "CD56", "CD82", "CD58", "CD82", "CD119", "MESOTHELIN", "CD10", "GPR56", "HLA-DR", "CD13", "CD15", "CD26", "CD90", "CD117", "CD119", "CD133", "CD155", "CD41", "CD22")]
+ncells <- nrow(imputed_abc)
+multi_matrix <- matrix(NA, length(all_ags), length(all_ags))
+rownames(multi_matrix) <- all_ags
+colnames(multi_matrix) <- all_ags
+multi_matrix_alt <- multi_matrix
+multi_matrix_euc <- multi_matrix
+p1_matrix <- p2_matrix <- multi_matrix
+for (ag1 in 1:(length(all_ags) - 1)) {
+  for (ag2 in (ag1 + 1):length(all_ags)) {
+    
+   ag1_fraction <- sum(imputed_abc[, which(colnames(imputed_abc) == all_ags[ag1])] > ag_thr) / ncells
+   ag2_fraction <- sum(imputed_abc[, which(colnames(imputed_abc) == all_ags[ag2])] > ag_thr) / ncells
+   
+   if (ag2_fraction > ag1_fraction) {
+     primary_ag <- all_ags[ag2]
+     secondary_ag <- all_ags[ag1]
+   } else {
+     primary_ag <- all_ags[ag1]
+     secondary_ag <- all_ags[ag2]
+   }
+   
+   p1 <- sum(imputed_abc[, primary_ag] > ag_thr) / ncells
+   p2 <- sum(imputed_abc[, primary_ag] < ag_thr & imputed_abc[, secondary_ag] > ag_thr) / ncells
+   p3 <- sum(imputed_abc[, primary_ag] < ag_thr & imputed_abc[, secondary_ag] < ag_thr) / ncells
+   
+   metric <- 2*p2
+   multi_matrix[ag2, ag1] <- metric
+   multi_matrix_alt[ag2, ag1] <- log10(p1 + p2) + log10(p1) + log10(p2)
+   multi_matrix_euc[ag2, ag1] <- 1 - (sqrt((p1 - 0.5)^2 + (p2 - 0.5)^2) / sqrt(0.5^2 + 0.5^2))
+   p1_matrix[ag2, ag1] <- p1
+   p2_matrix[ag2, ag1] <- p2
+   
+  }
+}
+
+x <- multi_matrix %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("ag1") %>%
+  tidyr::pivot_longer(-ag1, names_to = "ag2", values_to = "simple") %>%
+  dplyr::filter(!is.na(simple))
+
+y <- multi_matrix_alt %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("ag1") %>%
+  tidyr::pivot_longer(-ag1, names_to = "ag2", values_to = "log") %>%
+  dplyr::filter(!is.na(log))
+
+z <- multi_matrix_euc %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("ag1") %>%
+  tidyr::pivot_longer(-ag1, names_to = "ag2", values_to = "euclidean") %>%
+  dplyr::filter(!is.na(euclidean))
+
+p1 <- p1_matrix %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("ag1") %>%
+  tidyr::pivot_longer(-ag1, names_to = "ag2", values_to = "p1") %>%
+  dplyr::filter(!is.na(p1))
+
+p2 <- p2_matrix %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("ag1") %>%
+  tidyr::pivot_longer(-ag1, names_to = "ag2", values_to = "p2") %>%
+  dplyr::filter(!is.na(p2))
+
+test <- dplyr::full_join(x, y, by = c("ag1", "ag2")) %>%
+  dplyr::left_join(z, by = c("ag1", "ag2")) %>%
+  dplyr::left_join(p1, by = c("ag1", "ag2")) %>%
+  dplyr::left_join(p2, by = c("ag1", "ag2"))
+
+plot_ly(test,
+         x = ~p1,
+         y = ~p2,
+         z = ~simple,
+         type = "scatter3d",
+         mode = "markers",
+         marker = list(size = 3))
+
+plot_ly(test,
+         x = ~p1,
+         y = ~p2,
+         z = ~log,
+         type = "scatter3d",
+         mode = "markers",
+         marker = list(size = 3))
+
+plot_ly(test,
+         x = ~p1,
+         y = ~p2,
+         z = ~euclidean,
+         type = "scatter3d",
+         mode = "markers",
+         marker = list(size = 3))
+
+
+
+multi_matrix_heatdata <- multi_matrix
+multi_matrix_heatdata[upper.tri(multi_matrix_heatdata)] <- t(multi_matrix_heatdata)[upper.tri(multi_matrix_heatdata)]
+row_order <- hclust(dist(multi_matrix_heatdata))$order
+col_order <- hclust(dist(t(multi_matrix_heatdata)))$order
+multi_matrix_heatdata <- multi_matrix_heatdata[rev(row_order), rev(row_order)]
+
+#multi_matrix_heatdata <- multi_matrix_heatdata[rowMeans(multi_matrix_heatdata, na.rm = TRUE) > 0.25, ]
+multi_matrix_heatdata <- multi_matrix_heatdata[, rownames(multi_matrix_heatdata)]
+
+multi_matrix_heatdata[upper.tri(multi_matrix_heatdata, diag = TRUE)] <- NA
+
+split_lev <- case_when(colnames(multi_matrix_heatdata) == "CD33" ~ 1,
+                       colnames(multi_matrix_heatdata) == "CLL-1" ~ 1,
+                       TRUE ~ 0)
+ag_split <- NULL
+counter <- 0
+ag_split[1] <- counter
+for (i in 2:length(split_lev)) {
+  if (split_lev[i] != split_lev[i-1]) {
+    counter <- counter + 1
+  }
+  ag_split[i] <- counter
+}
+
+ComplexHeatmap::Heatmap(multi_matrix_heatdata, 
+                        cluster_rows = FALSE,
+                        cluster_columns = FALSE,
+                        #column_split = ag_split,
+                        row_split = ag_split,
+                        column_split = ag_split,
+                        row_title = NULL,
+                        column_title = NULL,
+                        cluster_row_slices = FALSE,
+                        cluster_column_slices = FALSE,
+                        na_col = "white",
+                        col = c("white", "red2"),
+                        row_names_side = "left",
+                        rect_gp = grid::gpar(col = "white", lwd = 1),
+                        heatmap_legend_param = list(title = "Multi-targeting index"))
+
+
+```
+
+
+
+
+# Analyze CD33 and CLL1 co-expression
+## Hexbin
+```{r cd33_cll1_coexpression}
+
+abc_coexpr <- imputed_abc[, colnames(imputed_abc) %in% c("CD33", "CLL1", "CD123", "EMR2")]
+abc_coexpr <- abc_coexpr %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("barcode") %>%
+  tidyr::pivot_longer(-barcode, values_to = "estimated_antigen_density", names_to = "ag") %>%
+  dplyr::mutate(patient_id = gsub(".*-", "", barcode),
+                patient_id = gsub("_Diagnosis|_Relapse", "", patient_id),
+                timepoint = gsub(".*_", "", barcode),
+                ag = factor(ag, levels = c("CD33", "CLL1", "CD123", "EMR2"))) %>%
+  dplyr::left_join(fmo_df, by = c("patient_id" = "patient")) %>%
+  dplyr::filter(ag %in% c("CD33", "CLL1")) %>%
+  dplyr::select(-fcs_file, -patient_id) %>%
+  dplyr::mutate(positive = ifelse(estimated_antigen_density >= 1000, "yes", "no")) %>%
+  dplyr::select(-estimated_antigen_density, -fmo_ag_density_boundary) %>%
+  tidyr::pivot_wider(names_from = ag, values_from = positive) %>%
+  dplyr::mutate(coexpressed = dplyr::case_when(CLL1 == "yes" & CD33 == "yes" ~ "CD33+ CLL-1+",
+                                               CLL1 == "yes" & CD33 == "no" ~ "CD33neg CLL-1+",
+                                               CLL1 == "no" & CD33 == "yes" ~ "CD33+ CLL-1neg",
+                                               TRUE ~ "CD33neg CLL-1neg")) %>%
+  dplyr::mutate(coexpressed = factor(coexpressed, levels = c("CD33+ CLL-1+", "CD33+ CLL-1neg", "CD33neg CLL-1+", "CD33neg CLL-1neg")))
+
+diagnosis_table <- abc_coexpr %>%
+  dplyr::filter(timepoint %in% "Diagnosis")
+diagnosis_table <- table(diagnosis_table$coexpressed)
+diagnosis_table <- diagnosis_table / sum(diagnosis_table) * 100
+
+relapse_table <- abc_coexpr %>%
+  dplyr::filter(timepoint %in% "Relapse")
+relapse_table <- table(relapse_table$coexpressed)
+relapse_table <- relapse_table / sum(relapse_table) * 100
+
+blast_object <- dplyr::left_join(blast_object, dplyr::select(abc_coexpr, barcode, coexpressed), by = "barcode")
+DimPlot(blast_object, 
+        reduction = "umap", 
+        group.by = "coexpressed", 
+        split.by = "time", 
+        cols = c("orange", "yellowgreen", "steelblue3", "forestgreen")) + 
+  NoAxes()
+
+
+# follow-up request from TC 2024Nov20
+
+relapse_table_patient <- abc_coexpr %>%
+  dplyr::filter(timepoint %in% "Relapse") %>%
+  dplyr::mutate(patient = gsub(".*-", "", barcode)) %>%
+  dplyr::select(patient, barcode, coexpressed) %>%
+  dplyr::group_by(patient, coexpressed) %>%
+  dplyr::summarize(count = n()) %>%
+  dplyr::group_by(patient) %>%
+  dplyr::mutate(percent = count / sum(count) * 100) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-count) %>%
+  tidyr::pivot_wider(values_from = percent, names_from = coexpressed, values_fill = 0) %>%
+  janitor::clean_names() %>%
+  dplyr::arrange(desc(cd33neg_cll_1)) %>%
+  dplyr::mutate(patient = gsub("_Relapse", "", patient),
+                multiplex = ifelse(cd33neg_cll_1 > 10, "Yes", "No")) 
+
+ggbarplot(relapse_table_patient,
+          x = "patient",
+          y = "cd33neg_cll_1",
+          ylab = "% CD33neg CLL-1+ blasts",
+          fill = "multiplex",
+          palette = "jco",
+          legend.position = "none") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(breaks = seq(0, 100, 10))
+  
+
+# summary table
+
+table_patient <- abc_coexpr %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", barcode)) %>%
+  dplyr::select(sample_id, barcode, coexpressed) %>%
+  dplyr::group_by(sample_id, coexpressed) %>%
+  dplyr::summarize(count = n()) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::mutate(percent = count / sum(count) * 100) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-count) %>%
+  tidyr::pivot_wider(values_from = percent, names_from = coexpressed, values_fill = 0)
+
+
+
+
+bardata <- abc_coexpr %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", barcode)) %>%
+  dplyr::select(sample_id, barcode, coexpressed) %>%
+  dplyr::group_by(sample_id, coexpressed) %>%
+  dplyr::summarize(count = n()) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::mutate(percent = count / sum(count) * 100) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(patient = gsub("_Diagnosis|_Relapse|atient_", "", sample_id),
+                time = ifelse(grepl("Diagnosis", sample_id), "D", "R")) %>%
+  dplyr::left_join(patient_id_map, by = "patient")
+
+ggplot(bardata, aes(x = time, y = count, fill = coexpressed)) + 
+  geom_bar(position = "fill", stat = "identity", width = 0.7) + 
+  xlab("") +
+  ylab("Fraction of blasts") +
+  facet_grid(~patient_manuscript_id) +
+  #scale_fill_manual(values = mycols) +
+  theme_light() +
+  theme(axis.text.y = element_text(size = 14),
+        axis.title.y = element_text(size = 14)) +
+  scale_fill_manual(values = c("orange", "yellowgreen", "steelblue3", "forestgreen"))
+
+quad1 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CLL1 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad2 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CLL1 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad3 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CLL1 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad4 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CLL1 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+
+max_limit <- max(dplyr::select(imputed_abc, CD33, CLL1))
+
+ggplot(data = imputed_abc, aes(x = CD33, y = CLL1)) +
+  geom_hex(bins = 30) +  # Adjust bins for desired resolution
+  #geom_density_2d(alpha = 0.3, color = "gray") +
+  ggtitle("Estimated # of antigens on blast surface") + xlab("CD33") + ylab("CLL-1") +
+  scale_x_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  scale_y_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  geom_vline(xintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_vline(xintercept = 1000, color = "black") +
+  geom_hline(yintercept = 1000, color = "black") +
+  scale_fill_gradient(low = "white", high = "red3", name = "# of blasts") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 15),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 60000, y = 60000, label = quad1, color = "black", size = 5) +
+  annotate("text", x = 200, y = 60000, label = quad2, color = "black", size = 5) +
+  annotate("text", x = 200, y = 150, label = quad3, color = "black", size = 5) +
+  annotate("text", x = 60000, y = 150, label = quad4, color = "black", size = 5)
+
+
+# CD33 with CD305
+quad1 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD305 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad2 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD305 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad3 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD305 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad4 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD305 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+
+max_limit <- max(dplyr::select(imputed_abc, CD33, CD305))
+
+ggplot(data = imputed_abc, aes(x = CD33, y = CD305)) +
+  geom_hex(bins = 30) +  # Adjust bins for desired resolution
+  ggtitle("Estimated # of antigens on blast surface") + xlab("CD33") + ylab("LAIR1") +
+  scale_x_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  scale_y_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  geom_vline(xintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_vline(xintercept = 1000, color = "black") +
+  geom_hline(yintercept = 1000, color = "black") +
+  scale_fill_gradient(low = "white", high = "red3", name = "# of blasts") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 15),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 60000, y = 60000, label = quad1, color = "black", size = 5) +
+  annotate("text", x = 200, y = 60000, label = quad2, color = "black", size = 5) +
+  annotate("text", x = 200, y = 150, label = quad3, color = "black", size = 5) +
+  annotate("text", x = 60000, y = 150, label = quad4, color = "black", size = 5)
+
+
+# CD33 with CD49D
+quad1 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD49D > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad2 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD49D > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad3 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD49D < 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad4 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD49D < 1000) / nrow(imputed_abc) * 100, 2), "%")
+
+max_limit <- max(dplyr::select(imputed_abc, CD33, CD49D))
+
+ggplot(data = imputed_abc, aes(x = CD33, y = CD49D)) +
+  geom_hex(bins = 30) +  # Adjust bins for desired resolution
+  ggtitle("Estimated # of antigens on blast surface") + xlab("CD33") + ylab("ITG4A") +
+  scale_x_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  scale_y_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  geom_vline(xintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_vline(xintercept = 1000, color = "black") +
+  geom_hline(yintercept = 1000, color = "black") +
+  scale_fill_gradient(low = "white", high = "red3", name = "# of blasts") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 15),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 60000, y = 60000, label = quad1, color = "black", size = 5) +
+  annotate("text", x = 200, y = 60000, label = quad2, color = "black", size = 5) +
+  annotate("text", x = 200, y = 150, label = quad3, color = "black", size = 5) +
+  annotate("text", x = 60000, y = 150, label = quad4, color = "black", size = 5)
+
+# CD33 with CD205
+quad1 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD205 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad2 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD205 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad3 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD205 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad4 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD205 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+
+max_limit <- max(dplyr::select(imputed_abc, CD33, CD205))
+
+ggplot(data = imputed_abc, aes(x = CD33, y = CD205)) +
+  geom_hex(bins = 30) +  # Adjust bins for desired resolution
+  ggtitle("Estimated # of antigens on blast surface") + xlab("CD33") + ylab("DEC-205") +
+  scale_x_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  scale_y_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  geom_vline(xintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_vline(xintercept = 1000, color = "black") +
+  geom_hline(yintercept = 1000, color = "black") +
+  scale_fill_gradient(low = "white", high = "red3", name = "# of blasts") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 15),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 60000, y = 60000, label = quad1, color = "black", size = 5) +
+  annotate("text", x = 200, y = 60000, label = quad2, color = "black", size = 5) +
+  annotate("text", x = 200, y = 150, label = quad3, color = "black", size = 5) +
+  annotate("text", x = 60000, y = 150, label = quad4, color = "black", size = 5)
+
+# CD33 with CD244
+quad1 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD244 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad2 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD244 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad3 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD244 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad4 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD244 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+
+max_limit <- max(dplyr::select(imputed_abc, CD33, CD244))
+
+ggplot(data = imputed_abc, aes(x = CD33, y = CD244)) +
+  geom_hex(bins = 30) +  # Adjust bins for desired resolution
+  ggtitle("Estimated # of antigens on blast surface") + xlab("CD33") + ylab("CD244") +
+  scale_x_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  scale_y_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  geom_vline(xintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_vline(xintercept = 1000, color = "black") +
+  geom_hline(yintercept = 1000, color = "black") +
+  scale_fill_gradient(low = "white", high = "red3", name = "# of blasts") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 15),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 60000, y = 60000, label = quad1, color = "black", size = 5) +
+  annotate("text", x = 200, y = 60000, label = quad2, color = "black", size = 5) +
+  annotate("text", x = 200, y = 150, label = quad3, color = "black", size = 5) +
+  annotate("text", x = 60000, y = 150, label = quad4, color = "black", size = 5)
+
+
+
+
+# CD33 with CD16
+quad1 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD16 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad2 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD16 > 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad3 <- paste0(round(sum(imputed_abc$CD33 < 1000 & imputed_abc$CD16 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+quad4 <- paste0(round(sum(imputed_abc$CD33 > 1000 & imputed_abc$CD16 < 1000) / nrow(imputed_abc) * 100, 2), "%")
+
+max_limit <- max(dplyr::select(imputed_abc, CD33, CD16))
+
+ggplot(data = imputed_abc, aes(x = CD33, y = CD16)) +
+  geom_hex(bins = 30) +  # Adjust bins for desired resolution
+  ggtitle("Estimated # of antigens on blast surface") + xlab("CD33") + ylab("CD16") +
+  scale_x_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  scale_y_log10(limits = c(100, max_limit), breaks = c(100, 1000, 5000, 10000, 100000), labels = c("\u2264100", "1000", "5000", "10,000", "100,000")) +
+  geom_vline(xintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = c(5000, 10000), linetype = "dotted", color = "black") +
+  geom_vline(xintercept = 1000, color = "black") +
+  geom_hline(yintercept = 1000, color = "black") +
+  scale_fill_gradient(low = "white", high = "red3", name = "# of blasts") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 15),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 60000, y = 60000, label = quad1, color = "black", size = 5) +
+  annotate("text", x = 200, y = 60000, label = quad2, color = "black", size = 5) +
+  annotate("text", x = 200, y = 150, label = quad3, color = "black", size = 5) +
+  annotate("text", x = 60000, y = 150, label = quad4, color = "black", size = 5)
+
+
+
+
+
+
+DefaultAssay(blast_object) <- "RNA"
+CD33_rna <- FetchData(blast_object, vars = "CD33", layer = "data")
+DefaultAssay(blast_object) <- "ADT"
+CD33_adt <- FetchData(blast_object, vars = "CD33", layer = "data")
+mydata <- data.frame("rna" = CD33_rna$CD33, "adt" = CD33_adt$CD33)
+
+ggscatter(data = mydata[sample(1:nrow(mydata), 10000), ],
+          title = "CD33",
+          x = "rna",
+          y = "adt",
+          size = 0.1) +
+  #scale_y_log10() +
+  stat_density_2d(bins = 50)
+
+DefaultAssay(blast_object) <- "ADT"
+CD33 <- FetchData(blast_object, vars = "CD33", layer = "data")
+CLL1 <- FetchData(blast_object, vars = "CLL1", layer = "data")
+mydata <- data.frame("CD33" = CD33$CD33, "CLL1" = CLL1$CLL1)
+
+ggscatter(data = mydata[sample(1:nrow(mydata), 5000), ],
+          x = "CD33",
+          y = "CLL1",
+          size = 0.02) +
+  stat_density_2d(bins = 10)
+
+
+```
+
+## Barplot
+```{r barplot_coexpression}
+
+find_possible_pairs <- function(features) {
+  stopifnot(length(features) > 1)
+  mypairs <- list()
+  for (i in 1:(length(features) - 1)) {
+    for (j in (i + 1):length(features)) {
+      mypairs <- c(mypairs, list(c(features[i], features[j])))
+    }
+  }
+  return(mypairs)
+}
+
+pairs <- find_possible_pairs(features = c("CD11A", "CD4"))
+
+#selected_patient_data <- imputed_abc[grepl("Patient_70_Relapse", rownames(imputed_abc)), ]
+selected_patient_data <- imputed_abc
+#ag_thresholds <- c(300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500)
+ag_thresholds <- seq(500, 10000, 500)
+plotdata_list <- lapply(ag_thresholds, function(thr) {
+  
+  plotdata <- lapply(pairs, function(arg) {
+    
+    ag1 <- arg[1]
+    ag2 <- arg[2]
+    
+    # union_counts <- sum(selected_patient_data[, arg[1]] > thr & selected_patient_data[, arg[2]] > thr)
+    # ag1 <- sum(selected_patient_data[, arg[1]] > thr & !selected_patient_data[, arg[2]] > thr)
+    # ag2 <- sum(!selected_patient_data[, arg[1]] > thr & selected_patient_data[, arg[2]] > thr)
+    # uncovered <- sum(!selected_patient_data[, arg[1]] > thr & !selected_patient_data[, arg[2]] > thr)
+    # 
+    # myout <- c(union_counts, ag1, ag2, uncovered)
+    
+    uncovered <- sum((selected_patient_data[, ag1] + selected_patient_data[, ag2]) < thr)
+    ag1_cover <- sum(selected_patient_data[, ag1] > thr)
+    lift <- sum((selected_patient_data[, ag1] < thr) & ((selected_patient_data[, ag1] + selected_patient_data[, ag2]) > thr))
+    myout <- c(uncovered, ag1_cover, lift)
+    stopifnot(sum(myout) == nrow(selected_patient_data))
+    myout <- myout / sum(myout) * 100
+    return(myout)
+    
+  })
+  
+  plotdata <- do.call("rbind", plotdata)
+  #colnames(plotdata) <- c("co-expressed", "CD33", "CLL-1", "below threshold")
+  colnames(plotdata) <- c("Below threshold", "ag1", "ag2")
+  plotdata <- as.data.frame(plotdata) %>%
+    dplyr::mutate(pair = lapply(pairs, function(arg) paste(arg, collapse = " | ")) %>% unlist()) %>%
+    tidyr::pivot_longer(-pair, names_to = "Coverage") %>%
+    dplyr::mutate(threshold = thr)
+
+})
+
+plotdata <- do.call("rbind", plotdata_list)
+
+plotdata <- plotdata %>%
+  dplyr::arrange(threshold) %>%
+  dplyr::mutate(Coverage = factor(Coverage, levels = c("Below threshold", "ag2", "ag1")),
+                threshold = factor(paste(">", threshold), levels = paste(">", unique(threshold))))
+levels(plotdata$Coverage) <- c("Below threshold", glue::glue("Expanded by {unlist(pairs)[2]}"), glue::glue("Covered by {unlist(pairs)[1]}"))
+
+ggbarplot(data = plotdata,
+          x = "threshold",
+          xlab = "Antigen number per blast",
+          y = "value",
+          ylab = glue::glue("% of AML blasts"),
+          fill = "Coverage",
+          color = "white",
+          legend = "top",
+          size = 1.5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(limits =  c(glue::glue("Covered by {unlist(pairs)[1]}"), glue::glue("Expanded by {unlist(pairs)[2]}"), "Below threshold"),
+                    values = c("mediumturquoise", "purple", "white")) +
+  scale_y_continuous(breaks = seq(0, 100, by = 10)) +
+  labs(fill = "")
+
+```
+
+# Generate UMAP plots showing Ag density at different thresholds
+```{r generate_umap_ag_density_thresholds}
+
+imputed_abc_ags <- imputed_abc[, c("CD33", "CLL1")]
+colnames(imputed_abc_ags) <- c("CD33", "CLL-1")
+stopifnot(all(rownames(imputed_abc_ags) == colnames(blast_object)))
+
+# Patients from TC analysis that benefit from multiplex tx is 31, 40, and 60, 
+sample_object <- blast_object %>% dplyr::filter(patient == "Patient_44")
+Idents(sample_object) <- "time"
+DefaultAssay(sample_object) <- "RNA"
+sample_object <- FindVariableFeatures(sample_object)
+# myfeats <- FindMarkers(sample_object, ident.1 = "Diagnosis") %>%
+#   dplyr::arrange(abs(avg_log2FC)) %>%
+#   dplyr::filter(p_val_adj < 1e-6) %>%
+#   dplyr::slice(1:1000)
+# myfeats <- rownames(myfeats)
+
+sample_object <- ScaleData(sample_object)
+sample_object <- RunPCA(sample_object)
+sample_object <- RunUMAP(sample_object, dims = 1:50, seed.use = 81298)
+DimPlot(sample_object, group.by = "time", reduction = "umap")
+
+plot_list <- lapply(c(1000, 2000, 3000), function(arg) {
+  
+  tmp <- imputed_abc_ags %>%
+    dplyr::mutate(count = rowSums(imputed_abc_ags > arg)) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("barcode") %>%
+    dplyr::mutate(label = case_when(count == 0 ~ "Below threshold",
+                                    count > 1 ~ "Multiple antigens",
+                                    CD33 > arg ~ "CD33 only",
+                                    `CLL-1` > arg ~ "CLL-1 only")) %>%
+    dplyr::group_split(label)
+  
+  mynam <- lapply(tmp, function(arg) unique(arg$label)) %>% unlist
+  tmp <- lapply(tmp, function(arg) dplyr::pull(arg, barcode))
+  names(tmp) <- mynam
+  tmp <- tmp[c("Below threshold", "Multiple antigens", "CD33 only", "CLL-1 only", "CD123 only", "ADGRE2 only")]
+  names(tmp) <- paste(rev(1:length(tmp)), names(tmp), sep = " ")
+  
+  DimPlot(sample_object, 
+          cells.highlight = tmp, 
+          cols.highlight = c("yellow", "skyblue3", "hotpink", "purple", "olivedrab3"),
+          reduction = "umap",
+          sizes.highlight = 0.3,
+          alpha = 0.6,
+          group.by = "time",
+          label = TRUE) +
+   NoAxes() + ggtitle(NULL) + theme_bw() + guides(x = "none", y = "none") + xlab("") + ylab("")
+
+})
+
+plot_list[[1]] / plot_list[[2]] / plot_list[[3]]
+  
+
+```
+
+# Test model on control cell populations
+## T cell population
+```{r test_model_tcell}
+
+mymodel <- aws.s3::s3read_using(FUN = readRDS, 
+                                object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/antigen_density_prediction_models/rf_model_2024-09-24.rds")
+
+# test model on T cells to validate
+input_data <- dplyr::filter(aml_data, cell_state_harmony_rna %in% c("CD4 T cell", "CD8 T cell"))@assays$ADT_dsb_qc_filter@data %>%
+  limma::normalizeQuantiles() %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("barcode") %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", barcode)) %>%
+  dplyr::left_join(ab_data, by = "sample_id") %>%
+  dplyr::mutate(patient = gsub(".*-|_Diagnosis|_Relapse", "", barcode)) %>%
+  dplyr::left_join(fmo_df, by = "patient") %>%
+  dplyr::filter(sample_id %in% mymodel$trainingData$sample_id)
+
+stopifnot(all(complete.cases(input_data)))
+myfeats <- rownames(blast_object@assays$ADT_dsb_qc_filter@data)
+
+tic()
+imputed_abc_tcell <- foreach(arg = myfeats, .combine = "cbind", .inorder = TRUE, .packages = c("randomForest", "e1071",  "dplyr")) %dopar% {
+  
+  newdata <- dplyr::select(input_data, all_of(arg), contains("antibody"))
+  colnames(newdata)[colnames(newdata) == arg] <- "abc_adt"
+  mypred <- predict(mymodel[[1]], newdata = newdata)
+  #mypred <- predict(og_mod, newdata = newdata)
+  mypred <- 10^mypred
+  mypred <- data.frame(mypred)
+  colnames(mypred) <- arg
+  gc()
+  return(mypred)
+  
+}
+toc()
+rownames(imputed_abc_tcell) <- input_data$barcode
+
+#sanity checks
+iso_df <- dplyr::select(input_data, starts_with("ISOTYPE"))
+iso_df <- data.frame(ADT_type = "Isotype control", mean_ag = rowMeans(iso_df))
+
+myeloid_df  <- dplyr::select(input_data, !starts_with("ISOTYPE"))
+myeloid_df <- data.frame(ADT_type = "Myeloid antibody", mean_ag = rowMeans(myeloid_df[, c("CD33", "CLL1", "CD123", "EMR2")]))
+
+lym_df  <- dplyr::select(input_data, !starts_with("ISOTYPE"))
+lym_df <- data.frame(ADT_type = "Lymphoid antibody", mean_ag = rowMeans(lym_df[, colnames(lym_df) %in% c("CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+ab_df  <- dplyr::select(input_data, !starts_with("ISOTYPE")) %>%
+  dplyr::select(!starts_with("antibody"), -sample_id, -barcode, -patient, -fcs_file, -fmo_ag_density_boundary)
+ab_df <- data.frame(ADT_type = "Other antibody", mean_ag = rowMeans(ab_df[, !colnames(ab_df) %in% c("CD33", "CLL1", "CD123", "EMR2", "CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+sanity_data <- bind_rows(myeloid_df, lym_df, ab_df, iso_df) %>%
+  dplyr::filter(!is.na(mean_ag)) %>%
+  dplyr::mutate(ADT_type = factor(ADT_type, levels = c("Myeloid antibody", "Lymphoid antibody", "Other antibody", "Isotype control")))
+
+gghistogram(sanity_data, 
+            x = "mean_ag", 
+            xlab = "Average normalized ADT",
+            ylab = "Number of cells",
+            xlim = c(-1, 10),
+            fill = "ADT_type", 
+            color = "white", 
+            bins = 100,
+            palette = c("cornflowerblue", "forestgreen", "purple", "black"))
+
+iso_df <- dplyr::select(imputed_abc_tcell, starts_with("ISOTYPE"))
+iso_df <- data.frame(ADT_type = "Isotype control", mean_ag = rowMeans(iso_df))
+
+myeloid_df  <- dplyr::select(imputed_abc_tcell, !starts_with("ISOTYPE"))
+myeloid_df <- data.frame(ADT_type = "Myeloid antibody", mean_ag = rowMeans(myeloid_df[, c("CD33", "CLL1", "CD123", "EMR2")]))
+
+lym_df  <- dplyr::select(imputed_abc_tcell, !starts_with("ISOTYPE"))
+lym_df <- data.frame(ADT_type = "Lymphoid antibody", mean_ag = rowMeans(lym_df[, colnames(lym_df) %in% c("CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+ab_df  <- dplyr::select(imputed_abc_tcell, !starts_with("ISOTYPE"))
+ab_df <- data.frame(ADT_type = "Other antibody", mean_ag = rowMeans(ab_df[, !colnames(ab_df) %in% c("CD33", "CLL1", "CD123", "EMR2", "CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+sanity_data <- bind_rows(myeloid_df, lym_df, ab_df, iso_df) %>%
+  dplyr::filter(!is.na(mean_ag)) %>%
+  dplyr::mutate(ADT_type = factor(ADT_type, levels = c("Other antibody", "Myeloid antibody", "Isotype control", "Lymphoid antibody")))
+
+gghistogram(sanity_data, 
+            x = "mean_ag", 
+            xlab = "Average predicted antigen density",
+            ylab = "Number of cells",
+            xlim = c(0, 60000),
+            fill = "ADT_type", 
+            color = "white", 
+            bins = 100,
+            palette = c("purple", "cornflowerblue", "black", "forestgreen")) +
+  geom_vline(xintercept = 500, lty = 2)
+
+cd3_df  <- dplyr::select(imputed_abc_tcell, "CD3")
+
+gghistogram(cd3_df, 
+            x = "CD3", 
+            main = "T cells",
+            xlab = "Esimated # of CD3 Ags",
+            ylab = "Number of cells",
+            #xlim = c(0, 60000),
+            fill = "darkgreen", 
+            bins = 50) +
+  geom_vline(xintercept = 500, lty = 2)
+
+```
+
+## B cell population
+```{r test_model_bcell}
+
+# test model on T cells to validate
+input_data <- dplyr::filter(aml_data, cell_state_harmony_rna %in% c("B cell"))@assays$ADT_dsb_qc_filter@data %>%
+  limma::normalizeQuantiles() %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("barcode") %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", barcode)) %>%
+  dplyr::left_join(ab_data, by = "sample_id") %>%
+  dplyr::mutate(patient = gsub(".*-|_Diagnosis|_Relapse", "", barcode)) %>%
+  dplyr::left_join(fmo_df, by = "patient") %>%
+  dplyr::filter(sample_id %in% og_mod$trainingData$sample_id)
+
+stopifnot(all(complete.cases(input_data)))
+myfeats <- rownames(blast_object@assays$ADT_dsb_qc_filter@data)
+
+tic()
+imputed_abc_tcell <- foreach(arg = myfeats, .combine = "cbind", .inorder = TRUE, .packages = c("randomForest", "e1071",  "dplyr")) %dopar% {
+  
+  newdata <- dplyr::select(input_data, all_of(arg), contains("antibody"))
+  colnames(newdata)[colnames(newdata) == arg] <- "abc_adt"
+  mypred <- predict(gbmFit1, newdata = newdata)
+  #mypred <- predict(og_mod, newdata = newdata)
+  mypred <- 10^mypred
+  mypred <- data.frame(mypred)
+  colnames(mypred) <- arg
+  gc()
+  return(mypred)
+  
+}
+toc()
+rownames(imputed_abc_tcell) <- input_data$barcode
+
+#sanity checks
+iso_df <- dplyr::select(input_data, starts_with("ISOTYPE"))
+iso_df <- data.frame(ADT_type = "Isotype control", mean_ag = rowMeans(iso_df))
+
+myeloid_df  <- dplyr::select(input_data, !starts_with("ISOTYPE"))
+myeloid_df <- data.frame(ADT_type = "Myeloid antibody", mean_ag = rowMeans(myeloid_df[, c("CD33", "CLL1", "CD123", "EMR2")]))
+
+lym_df  <- dplyr::select(input_data, !starts_with("ISOTYPE"))
+lym_df <- data.frame(ADT_type = "Lymphoid antibody", mean_ag = rowMeans(lym_df[, colnames(lym_df) %in% c("CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+ab_df  <- dplyr::select(input_data, !starts_with("ISOTYPE")) %>%
+  dplyr::select(!starts_with("antibody"), -sample_id, -barcode, -patient, -fcs_file, -fmo_ag_density_boundary)
+ab_df <- data.frame(ADT_type = "Other antibody", mean_ag = rowMeans(ab_df[, !colnames(ab_df) %in% c("CD33", "CLL1", "CD123", "EMR2", "CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+sanity_data <- bind_rows(myeloid_df, lym_df, ab_df, iso_df) %>%
+  dplyr::filter(!is.na(mean_ag)) %>%
+  dplyr::mutate(ADT_type = factor(ADT_type, levels = c("Myeloid antibody", "Lymphoid antibody", "Other antibody", "Isotype control")))
+
+gghistogram(sanity_data, 
+            x = "mean_ag", 
+            xlab = "Average normalized ADT",
+            ylab = "Number of cells",
+            xlim = c(-1, 10),
+            fill = "ADT_type", 
+            color = "white", 
+            bins = 100,
+            palette = c("cornflowerblue", "forestgreen", "purple", "black"))
+
+iso_df <- dplyr::select(imputed_abc_tcell, starts_with("ISOTYPE"))
+iso_df <- data.frame(ADT_type = "Isotype control", mean_ag = rowMeans(iso_df))
+
+myeloid_df  <- dplyr::select(imputed_abc_tcell, !starts_with("ISOTYPE"))
+myeloid_df <- data.frame(ADT_type = "Myeloid antibody", mean_ag = rowMeans(myeloid_df[, c("CD33", "CLL1", "CD123", "EMR2")]))
+
+lym_df  <- dplyr::select(imputed_abc_tcell, !starts_with("ISOTYPE"))
+lym_df <- data.frame(ADT_type = "Lymphoid antibody", mean_ag = rowMeans(lym_df[, colnames(lym_df) %in% c("CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+ab_df  <- dplyr::select(imputed_abc_tcell, !starts_with("ISOTYPE"))
+ab_df <- data.frame(ADT_type = "Other antibody", mean_ag = rowMeans(ab_df[, !colnames(ab_df) %in% c("CD33", "CLL1", "CD123", "EMR2", "CD3", "CD4", "CD8", "CD19", "CD22")]))
+
+sanity_data <- bind_rows(myeloid_df, lym_df, ab_df, iso_df) %>%
+  dplyr::filter(!is.na(mean_ag)) %>%
+  dplyr::mutate(ADT_type = factor(ADT_type, levels = c("Other antibody", "Myeloid antibody", "Isotype control", "Lymphoid antibody")))
+
+gghistogram(sanity_data, 
+            x = "mean_ag", 
+            xlab = "Average predicted antigen density",
+            ylab = "Number of cells",
+            xlim = c(0, 60000),
+            fill = "ADT_type", 
+            color = "white", 
+            bins = 100,
+            palette = c("purple", "cornflowerblue", "black", "forestgreen")) +
+  geom_vline(xintercept = 500, lty = 2)
+
+cd19_df  <- dplyr::select(imputed_abc_tcell, "CD19")
+
+gghistogram(cd19_df, 
+            x = "CD19", 
+            main = "T cells",
+            xlab = "Esimated # of CD3 Ags",
+            ylab = "Number of cells",
+            #xlim = c(0, 60000),
+            fill = "darkgreen", 
+            bins = 50) +
+  geom_vline(xintercept = 500, lty = 2)
+
+```
+
+## Test on engineered cell lines
+```{r engineered_cell_lines}
+
+eng_cell_data_matrix <- aws.s3::s3read_using(FUN = Seurat::Read10X_h5, 
+                                      object = "s3://vorbio-analysis/single_cell/internal/DME-240603_VH00296_91_AACHTTVHV/aggregated/outs/count/filtered_feature_bc_matrix.h5")
+ 
+raw_feature <- aws.s3::s3read_using(FUN = Seurat::Read10X_h5,
+                                    object = "s3://vorbio-analysis/single_cell/internal/DME-240603_VH00296_91_AACHTTVHV/aggregated/outs/count/raw_feature_bc_matrix.h5")
+
+aggr_csv <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                 object = "s3://vorbio-analysis/single_cell/internal/DME-240603_VH00296_91_AACHTTVHV/aggregated/outs/aggregation.csv") %>%
+  dplyr::mutate(suffix = as.character(1:4))
+
+metrics <- aws.s3::get_bucket_df(bucket = "s3://vorbio-analysis",
+                                       prefix = "single_cell/internal/DME-240603_VH00296_91_AACHTTVHV/") %>%
+  dplyr::filter(grepl("metrics_summary.csv", Key))
+
+metrics_list <- lapply(metrics$Key, function(arg) aws.s3::s3read_using(FUN = readr::read_csv, object = glue::glue("s3://vorbio-analysis/{arg}")))
+metrics <- do.call("rbind", metrics_list)
+metrics <- dplyr::mutate(metrics, suffix = as.character(1:4))
+
+eng_cell_data <- CreateSeuratObject(counts = eng_cell_data_matrix[["Gene Expression"]], assay = "RNA", min.cells = 10)
+
+eng_cell_data[["percent.mt"]] <- Seurat::PercentageFeatureSet(eng_cell_data, pattern = "^MT-")
+eng_cell_data[["percent.malat1"]] <- Seurat::PercentageFeatureSet(eng_cell_data, pattern = "MALAT1")
+eng_cell_data[["percent.rpl_rps"]] <- Seurat::PercentageFeatureSet(eng_cell_data, pattern = "^RPL|^RPS")
+
+select_features <- rownames(eng_cell_data@assays$RNA)[!grepl("^MT-|^RPS|^RPL|MALAT1", rownames(eng_cell_data@assays$RNA))]
+eng_cell_data <- subset(eng_cell_data, features = select_features)
+eng_cell_data <- dplyr::mutate(eng_cell_data, 
+                               barcode = colnames(eng_cell_data),
+                               suffix = gsub(".*-", "", barcode)) %>%
+  dplyr::left_join(aggr_csv, by = "suffix") %>%
+  dplyr::left_join(metrics, by = "suffix")
+
+adt_matrix <- eng_cell_data_matrix[["Antibody Capture"]]
+rownames(adt_matrix) <- gsub("\\..*", "", rownames(adt_matrix))
+eng_cell_data[["ADT"]] <- CreateAssayObject(counts = adt_matrix, assay = "ADT")
+
+eng_cell_data <- dplyr::filter(eng_cell_data,
+                               nCount_RNA > 1000,
+                               nFeature_RNA > 500,
+                               percent.mt < 15)
+
+eng_cell_data <- NormalizeData(eng_cell_data, assay = "RNA")
+eng_cell_data <- NormalizeData(eng_cell_data, assay = "ADT", normalization.method = "CLR", margin = 2)
+
+
+# select droplets based on RNA and ADT library size
+bg_adt_matrix <- raw_feature[["Antibody Capture"]]
+bg_rna_matrix <- raw_feature[["Gene Expression"]]
+adt_size <- Matrix::colSums(bg_adt_matrix)
+rna_size <- Matrix::colSums(bg_rna_matrix)
+names(rna_size) <- gsub(".*\\.", "", names(rna_size))
+overlap_bc <- intersect(names(adt_size), names(rna_size))
+adt_size <- adt_size[names(adt_size) %in% overlap_bc]
+rna_size <- rna_size[names(rna_size) %in% overlap_bc]
+stopifnot(all(names(adt_size) == names(rna_size)))
+
+qc_df <- data.frame(rna_size = rna_size, adt_size = adt_size) %>%
+  dplyr::filter(rna_size > 0 & adt_size > 0)
+
+mysample <- qc_df[sample(1:nrow(qc_df), 20000), ]
+ggscatter(data = mysample,
+          x = "adt_size",
+          y = "rna_size",
+          alpha = 0.1) +
+  scale_x_log10(breaks = c(1, 10, 100, 1000, 10000)) +
+  scale_y_log10() +
+  stat_density2d()
+
+# keep only empty droplets for background matrix
+bg_adt_matrix <- bg_adt_matrix[, !colnames(bg_adt_matrix) %in% colnames(eng_cell_data)]
+# remove droplets with zero signal
+bg_adt_matrix <- bg_adt_matrix[, colSums(bg_adt_matrix) > 10]
+# remove droplets near filter threshold based on histogram of droplet count sums
+bg_adt_matrix <- bg_adt_matrix[, colSums(bg_adt_matrix) < 1000]
+rownames(bg_adt_matrix) <- gsub("\\..*", "", rownames(bg_adt_matrix))
+rownames(bg_adt_matrix) <- gsub("_", "-", rownames(bg_adt_matrix))
+# normalize and de-noise with dsb
+dsb_norm_mat <- dsb::DSBNormalizeProtein(
+  
+  cell_protein_matrix = eng_cell_data@assays$ADT@counts, 
+  empty_drop_matrix = bg_adt_matrix, 
+  denoise.counts = TRUE, 
+  use.isotype.control = TRUE, 
+  isotype.control.name.vec = c("Isotype-IgG1K", "Isotype-Rat", "Isotype-Armenian-Hamster"),
+  pseudocount.use = 10
+  
+)
+
+eng_cell_data[["ADT_dsb"]] <- CreateAssayObject(data = dsb_norm_mat)
+eng_cell_data[["ADT_dsb_qn"]]  <- CreateAssayObject(limma::normalizeQuantiles(eng_cell_data@assays$ADT_dsb@data))
+
+ab_data <- eng_cell_data@meta.data %>%
+  as.data.frame() %>%
+  janitor::clean_names() %>%
+  dplyr::mutate_all(function(arg) gsub("%", "", arg)) %>%
+  dplyr::select(contains("antibody")) %>%
+  dplyr::mutate_at(vars(contains("antibody")), .funs = as.numeric)
+
+input_data <- eng_cell_data@assays$ADT_dsb_qn@data %>% t() %>% as.data.frame()
+myfeats <- colnames(input_data)
+input_data <- cbind(input_data, ab_data) %>% as.data.frame()
+
+model <- aws.s3::s3readRDS(object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/antigen_density_prediction_models/gbm_model_2024-04-24.rds")[[1]]
+tic()
+imputed_abc <- foreach::foreach(arg = myfeats, .combine = "cbind", .inorder = TRUE, .packages = c("randomForest", "e1071",  "dplyr", "caret")) %dopar% {
+  
+  newdata <- dplyr::select(input_data, all_of(arg), contains("antibody"))
+  colnames(newdata)[colnames(newdata) == arg] <- "abc_adt"
+  mypred <- predict(model, newdata = newdata)
+  mypred <- 10^mypred
+  mypred <- data.frame(mypred)
+  colnames(mypred) <- arg
+  gc()
+  return(mypred)
+  
+}
+toc()
+
+rownames(imputed_abc) <- rownames(input_data)
+
+eng_cell_data[["predicted_ABC"]] <- CreateAssayObject(data = t(as.matrix(imputed_abc)))
+
+DefaultAssay(eng_cell_data) <- "predicted_ABC"
+eng_cell_data@assays$predicted_ABC@counts <- eng_cell_data@assays$predicted_ABC@data
+VlnPlot(eng_cell_data, group.by = 'sample_id', features = 'CD33', pt.size = 0, assay = 'predicted_ABC')
+
+
+DefaultAssay(eng_cell_data) <- "ADT"
+eng_cell_data <- eng_cell_data %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  FindNeighbors() %>%
+  FindClusters() %>%
+  RunUMAP(dims = 1:20)
+
+DimPlot(eng_cell_data, reduction = "umap", group.by = "seurat_clusters", label = TRUE, repel = TRUE) + NoAxes() + NoLegend()
+FeaturePlot(eng_cell_data, features = "CD33", reduction = "umap")
+
+```
+
+# Evaluate model performance on new Ags
+## Calculate correlation
+```{r compare_with_QB}
+
+myags <- c("CD33", "CD305", "CD49D", "CD205", "CD244")
+
+qb_abc <- aws.s3::s3read_using(FUN = readr::read_csv, 
+                               object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/quantibrite_model_ag_count_validation_blast_20241217.csv") %>%
+  dplyr::mutate(sample_id = paste0("Patient_", sample_id),
+                time = ifelse(grepl("D$", sample_id), "Diagnosis", "Relapse"),
+                sample_id = gsub("-.*", "", sample_id)) %>%
+  tidyr::unite(sample_id, sample_id, time, sep = "_") %>%
+  tidyr::pivot_longer(-sample_id, names_to = "antigen", values_to = "counts") %>%
+  dplyr::mutate(platform = "QuantiBRITE", antigen = toupper(antigen)) %>%
+  dplyr::filter(antigen %in% myags)
+
+grep_pattern <- paste(unique(qb_abc$sample_id), collapse = "|")
+
+pat_imputed_abc <- imputed_abc[grepl(grep_pattern, rownames(imputed_abc)), colnames(imputed_abc) %in% myags]
+pat_imputed_abc <- pat_imputed_abc %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("barcode") %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", barcode)) %>%
+  tidyr::pivot_longer(c(-barcode, -sample_id), names_to = "antigen", values_to = "counts") %>%
+  dplyr::group_by(sample_id, antigen) %>%
+  dplyr::filter(counts > 250) %>% # Set FMO cutoff; This number is equivalent to average FMO Ags/cell across batches
+  dplyr::summarize(counts = mean(counts)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(antigen = factor(antigen, levels = myags),
+                platform = "CITEseq estimation")
+
+plotdata <- dplyr::bind_rows(pat_imputed_abc, qb_abc) %>%
+  dplyr::mutate(antigen = case_when(antigen %in% "CD33" ~ "CD33",
+                                    antigen %in% "CD305" ~ "LAIR1",
+                                    antigen %in% "CD49D" ~ "ITGA4",
+                                    antigen %in% "CD205" ~ "DEC-205",
+                                    antigen %in% "CD244" ~ "CD244")) %>%
+  dplyr::mutate(antigen = factor(antigen, levels = c("CD33", "LAIR1", "ITGA4", "DEC-205", "CD244")),
+                patient = gsub("atient|_|Diagnosis|Relapse", "", sample_id)) %>%
+  dplyr::left_join(patient_id_map, by = "patient") %>%
+  dplyr::mutate(sample_manuscript_id = ifelse(grepl("Diagnosis", sample_id), paste0(patient_manuscript_id, "D"), paste0(patient_manuscript_id, "R"))) %>%
+  dplyr::select(sample_manuscript_id, antigen, platform, counts)
+
+ggpar(ggbarplot(plotdata,
+          x = "antigen",
+          y = "counts",
+          xlab = "",
+          ylab = "Mean # of antigens/cell",
+          fill = "platform",
+          facet.by = "sample_manuscript_id",
+          color = "white",
+          position = position_dodge(width = 0.5),
+          palette = "jco",
+          ncol = 5,
+          legend = "top") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_log10(), legend = "top")
+
+ggbarplot(dplyr::filter(plotdata, !antigen %in% "CD33", sample_manuscript_id %in% c("P10R", "P14D")),
+          x = "antigen",
+          y = "counts",
+          xlab = "",
+          ylab = "Avg # of antigens per cell",
+          #ylim = c(1, 20000),
+          fill = "platform",
+          facet.by = "sample_manuscript_id",
+          color = "white",
+          position = position_dodge(width = 0.5),
+          palette = "jco",
+          ncol = 5) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_hline(yintercept = 10000, lty = 2) +
+  scale_y_log10()
+
+scatterdata <- tidyr::pivot_wider(plotdata, names_from = "platform", values_from = "counts")
+
+colnames(scatterdata) <- c("Sample ID", "Ag", "model", "qb")
+mybreaks <- c(0, 5000, 10000, 15000, 20000, 25000, 30000, 40000)
+mylabels <- c("0", "5,000", "10,000", "15,000", "20,000", "25,000", "30,000", "40,000")
+ggscatter(data = scatterdata,
+          x = "model",
+          y = "qb",
+          xlim = c(0, 40000),
+          ylim = c(0, 40000),
+          xlab = "Mean estimated # antigens/cell",
+          ylab = "Mean measured # antigens/cell",
+          color = "Sample ID",
+          shape = "Ag",
+          size = 4,
+          alpha = 0.7,
+          cor.coef = TRUE,
+          cor.method = "pearson",
+          cor.coef.coord = c(1000, 28000),
+          cor.coeff.args = list(p.accuracy = 1e-21),
+          palette = "npg") +
+  geom_abline(slope = 1, lty = 2) +
+  scale_x_continuous(breaks = mybreaks, labels = mylabels) +
+  scale_y_continuous(breaks = mybreaks, labels = mylabels) +
+  theme_bw() +
+  theme(axis.text = element_text(angle = 45, hjust = 1, size = 13),
+        axis.title = element_text(size = 13)) 
+
+```
+## Retrain model to include validation data
+```{r retrain_model}
+
+
+
+```
+
+
+
+
+# Apply antigen density prediction approach on early cell line CITEseq data
+## Get cell line flow data and convert to Ag density using QuantiBRITE
+```{r cell_line_test}
+
+# april flow cytometry data
+flow_paths_april <- aws.s3::get_bucket(bucket = "vorbio-datascience",
+                                       prefix = "genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/cell_line/210416",
+                                       max = Inf)
+flow_paths_april <- lapply(flow_paths_april, `[`, 1) %>% unlist()
+flow_paths_april <- flow_paths_april[grepl(".fcs", flow_paths_april)]
+flow_paths_april <- paste0("s3://vorbio-datascience/", flow_paths_april)
+mynames <- gsub("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/cell_line/|.fcs", "", flow_paths_april)
+
+flow_list_april <- lapply(flow_paths_april, function(object_path) aws.s3::s3read_using(FUN = flowCore::read.FCS,
+                                                                                       transformation = FALSE,
+                                                                                       truncate_max_range = TRUE,
+                                                                                       object = object_path))
+flow_list_april <- lapply(flow_list_april, function(arg) flowCore::transform(arg, `Y586-A` = asinh(`Y586-A`)))
+names(flow_list_april) <- mynames
+flow_qb_april <- flow_list_april[grepl("Quantibrite", names(flow_list_april))] %>% unlist()
+flow_list_april <- flow_list_april[!grepl("Quantibrite", names(flow_list_april))]
+
+# may flow cytometry data
+flow_paths_may <- aws.s3::get_bucket(bucket = "vorbio-datascience",
+                                       prefix = "genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/cell_line/210525",
+                                       max = Inf)
+flow_paths_may <- lapply(flow_paths_may, `[`, 1) %>% unlist()
+flow_paths_may <- flow_paths_may[grepl(".fcs", flow_paths_may)]
+flow_paths_may <- paste0("s3://vorbio-datascience/", flow_paths_may)
+mynames <- gsub("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/flow_data/cell_line/|.fcs", "", flow_paths_may)
+
+flow_list_may <- lapply(flow_paths_may, function(object_path) aws.s3::s3read_using(FUN = flowCore::read.FCS,
+                                                                                         transformation = FALSE,
+                                                                                         truncate_max_range = TRUE,
+                                                                                         object = object_path))
+flow_list_may <- lapply(flow_list_may, function(arg) flowCore::transform(arg, `Y586-A` = asinh(`Y586-A`)))
+names(flow_list_may) <- mynames
+flow_qb_may <- flow_list_may[grepl("Quantibrite", names(flow_list_may))] %>% unlist()
+flow_list_may <- flow_list_may[!grepl("Quantibrite", names(flow_list_may))]
+
+# Convert FI to antigen density
+flow_qb_cell_line <- c(flow_qb_april, flow_qb_may)
+
+plot_list <- lapply(names(flow_qb_cell_line), function(arg) {
+  data.frame(fcs_file = arg,
+             PE = exprs(flow_qb_cell_line[[arg]])[, "Y586-A"])
+})
+names(plot_list) <- names(flow_qb_cell_line)
+
+plot_df <- do.call("rbind", plot_list) %>%
+  dplyr::mutate(fcs_file = gsub("\\/export.*", "", fcs_file))
+rownames(plot_df) <- NULL
+
+ggdensity(data = plot_df,
+          x = "PE",
+          xlab = "asinh PE",
+          color = "fcs_file",
+          legend = "right",
+          palette = "simpsons")
+
+# compute PE peak means for each sample
+set.seed(465012)
+sample_qb_mean <- lapply(names(plot_list), function(arg) {
+  
+  pe_mean <- sort(mclust::Mclust(data = plot_list[[arg]]$PE, G = 4)$parameters$mean, decreasing = FALSE)
+  data.frame(fcs_file = arg, peak = 1:4, pe_mean = pe_mean)
+  
+})
+
+plot_df <- do.call("rbind", sample_qb_mean) %>%
+  dplyr::left_join(qb_levels, by = "peak") %>%
+  dplyr::mutate(fcs_file = gsub("\\/export.*", "", fcs_file))
+
+ggscatter(data = plot_df,
+          x = "pe_mean",
+          y = "ag_density",
+          ylim = c(50, 100000),
+          xlab = "Mean asinh PE intensity",
+          ylab = "Log antigen density",
+          color = "fcs_file",
+          legend = "right",
+          palette = "lancet",
+           size = 3) +
+  scale_y_log10(labels = scales::comma) +
+  geom_smooth(se = FALSE, method = "lm", lty = 2, color = "black", linewidth = 0.5)
+
+ggscatter(data = plot_df,
+          x = "pe_mean",
+          y = "ag_density",
+          xlab = "Mean asinh PE intensity",
+          ylab = "Log antigen density",
+          facet.by = "fcs_file",
+          legend = "right",
+          palette = "lancet") +
+  scale_y_log10()
+
+qb_models_cell_line <- plot_df %>% 
+  dplyr::group_by(fcs_file) %>%
+  dplyr::group_split()
+
+mynam <- sapply(qb_models_cell_line, function(arg) unique(arg$fcs_file))
+qb_models_cell_line <- lapply(qb_models_cell_line, function(arg) lm(log10(ag_density) ~ pe_mean, data = arg))
+names(qb_models_cell_line) <- mynam
+
+```
+
+## Ag density prediction and validation
+```{r ag_density_cell_line_validation}
+
+# compute Ag quantiles
+myprobs <- 0.1
+df_list <- NULL
+df_quantile_list <- NULL
+df_mean_list <- NULL
+df_median_list <- NULL
+for (ag in c("CD33", "CLL1", "CD123")) {
+  
+  flow_list_ags_select <- flow_list_april[grepl(ag, names(flow_list_april))]
+
+  for (mynam in names(flow_list_ags_select)) {
+    
+    model_id <- gsub("\\/.*", "", mynam)
+    sample_id <- gsub(".*\\/", "", mynam)
+    sample_id <- gsub("_Live", "", sample_id)
+    sample_id <- gsub(".*_", "", sample_id)
+    
+    # extract FIs from flowCore object
+    fluor <- flow_list_ags_select[[mynam]]@parameters@data
+    fluor <- as.character(fluor$name[fluor$desc %in% ag])
+    if (length(fluor) == 0) fluor = "Y586-A"
+    fi <- exprs(flow_list_ags_select[[mynam]])
+    fi <- fi[, colnames(fi) %in% fluor]
+    
+    abc_model <- qb_models_cell_line[[model_id]]
+    abc <- predict(object = abc_model, newdata = data.frame(pe_mean = fi))
+    
+    if (length(abc) == 0) next
+    
+    # compute quantiles
+    myq <- quantile(abc, probs = seq(0, 1, myprobs), na.rm = TRUE)
+    df_list[[mynam]] <- data.frame(sample_id, ag, abc) # raw FI values
+    df_quantile_list[[mynam]] <- data.frame(sample_id, ag, quantile = names(myq), abc = myq) # ABC quantiles
+    df_median_list[[mynam]] <- data.frame(sample_id, ag, quantile = "50%", abc = median(abc))
+    
+    # quantile-binned averages
+    myq_bin <- NULL
+    for (q in 2:length(myq)) {
+      myq_bin[paste0("bin_", q-1)] <- mean(abc[abc >= myq[q-1] & abc < myq[q]])
+    }
+      
+    df_mean_list[[mynam]] <- data.frame(sample_id, ag, quantile_bin = names(myq_bin), abc = myq_bin) 
+
+  }
+}
+
+# raw FIs
+fi_df <- do.call("rbind", df_list)
+
+fi_quant_df <- do.call("rbind", df_quantile_list)
+
+
+
+#### Prepare CITEseq ADT data ####
+# cell line paths
+#experiment <- "single_cell/internal/SCSEQ-NTD-210525"
+experiment <- "single_cell/internal/SCSEQ-NTD-210416"
+
+cell_line_paths <- aws.s3::get_bucket(bucket = "vorbio-analysis", prefix = experiment, max = Inf)
+cell_line_paths <- lapply(cell_line_paths, `[`, 1) %>% unlist()
+cell_line_paths <- cell_line_paths[grepl("Jurkat|Molm-13|HL-60|THP-1", cell_line_paths, ignore.case = TRUE)]
+cell_line_paths <- cell_line_paths[!grepl("reanalyzed|aggregated", cell_line_paths, ignore.case = TRUE)]
+
+bg_matrix <- lapply(c("Jurkat", "Molm-13", "HL-60", "THP-1"), function(arg) {
+  
+  cell_line_matrix <- cell_line_paths[grepl("raw_feature_bc_matrix.h5", cell_line_paths) & grepl(arg, cell_line_paths, ignore.case = TRUE)]
+  cell_line_matrix <- cell_line_matrix[grepl("outs", cell_line_matrix)]
+  cell_line_matrix <- aws.s3::s3read_using(FUN = Read10X_h5, 
+                                           object = paste0("s3://vorbio-analysis/", cell_line_matrix))[["Antibody Capture"]]
+  colnames(cell_line_matrix) <- paste(colnames(cell_line_matrix), arg, sep = "_")
+  return(cell_line_matrix)
+  
+})
+bg_matrix <- do.call("cbind", bg_matrix)
+
+cell_protein_matrix <- lapply(c("Jurkat", "Molm-13", "HL-60", "THP-1"), function(arg) {
+  
+  cell_line_matrix <- cell_line_paths[grepl("filtered_feature_bc_matrix.h5", cell_line_paths) & grepl(arg, cell_line_paths)]
+  cell_line_matrix <- aws.s3::s3read_using(FUN = Read10X_h5, 
+                                           object = paste0("s3://vorbio-analysis/", cell_line_matrix))[["Antibody Capture"]]
+  colnames(cell_line_matrix) <- paste(colnames(cell_line_matrix), arg, sep = "_")
+  return(cell_line_matrix)
+  
+})
+cell_protein_matrix <- do.call("cbind", cell_protein_matrix)
+
+# keep only empty droplets for background matrix
+bg_matrix <- bg_matrix[, !colnames(bg_matrix) %in% colnames(cell_protein_matrix)]
+# remove droplets with zero signal
+bg_matrix <- bg_matrix[, colSums(bg_matrix) > nrow(bg_matrix)]
+# remove droplets near filter threshold based on histogram of droplet count sums
+#bg_matrix <- bg_matrix[, colSums(bg_matrix) < 1000]
+
+stopifnot(all(rownames(bg_matrix) %in% rownames(cell_protein_matrix)))
+
+# normalize and de-noise with dsb
+dsb_norm_mat <- dsb::DSBNormalizeProtein(
+  
+  cell_protein_matrix = cell_protein_matrix, 
+  empty_drop_matrix = bg_matrix, 
+  denoise.counts = TRUE, 
+  use.isotype.control = TRUE, 
+  #isotype.control.name.vec = c("IgG1_K_Isotype_TotalSeqC", "IgG2a_K_Isotype_TotalSeqC"),
+  isotype.control.name.vec = c("IgG1_K_Isotype_TotalSeqC"),
+  pseudocount.use = 1,
+  quantile.clipping = TRUE,
+
+)
+
+qn_data <- limma::removeBatchEffect(x = dsb_norm_mat, covariates = colSums(cell_protein_matrix))
+#qn_data <- limma::normalizeQuantiles(qn_data)
+blast_df <- dsb_norm_mat[rownames(qn_data) %in% c("CD33_P67.6_TotalSeqC", "CD123_6H6_TotalSeqC", "CD371_50C1_TotalSeqC"), ]
+blast_df <- t(blast_df)
+colnames(blast_df) <- c("CD33", "CD123", "CLL1")
+
+blast_list <- blast_df %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::mutate(sample_id = gsub(".*_|-", "", cell)) %>%
+  dplyr::select(-cell) %>%
+  tidyr::pivot_longer(-sample_id, names_to = "ag", values_to = "abc") %>%
+  dplyr::group_split(sample_id, ag)
+
+blast_list <- lapply(blast_list, function(arg) {
+  
+  adt_abc <- arg$abc
+  #adt_abc <- adt_abc[adt_abc > 0]
+  myq <- quantile(adt_abc, probs = seq(0, 1, myprobs))
+  mydf <- data.frame(sample_id = arg$sample_id[1], ag = arg$ag[1], quantile = names(myq), abc = myq)
+  return(mydf)
+  
+})
+
+blast_quantiles_df <- do.call("rbind", blast_list)
+
+fi_comdata <- dplyr::right_join(fi_quant_df, blast_quantiles_df, 
+                                by = c("sample_id", "ag", "quantile"), 
+                                suffix = c("_flow", "_adt"))
+
+trim_data_quantiles <- filter(
+  fi_comdata, 
+  !is.na(abc_flow)
+) %>% dplyr::mutate(ag_density = 10^abc_flow)
+
+ggpubr::ggscatter(data = trim_data_quantiles,
+                  x = "abc_adt",
+                  y = "ag_density",
+                  color = "sample_id",
+                  alpha = 0.3,
+                  xlab = glue::glue("DSB normalized ADT"),
+                  ylab = glue::glue("Antigen density"),
+                  cor.coef = TRUE,
+                  cor.method = "spearman",
+                  cor.coeff.args = list(size = 4),
+                  cor.coef.coord = c(4, 0.00001),
+                  size = 3,
+                  facet.by = "ag") +
+  geom_hline(yintercept = 100, lty = 3) +
+  scale_y_log10(breaks = c(1, 10, 100, 1000, 10000, 100000), labels = c("1", "10", "100", "1,000", "10,000", "100,000")) +
+  scale_x_continuous(breaks = -1:15) +
+  geom_vline(xintercept = 0, lty = 3) +
+  stat_density_2d(alpha = 0.2) 
+
+# cell_line_ab_metrics <- c("s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210525/210525_VH00296_5_AAAFG2THV_THP-1/outs/metrics_summary.csv",
+#                           "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210525/210525_VH00296_5_AAAFG2THV_HL-60/outs/metrics_summary.csv",
+#                           "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210525/210525_VH00296_5_AAAFG2THV_Molm-13/outs/metrics_summary.csv",
+#                           "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210525/210525_VH00296_5_AAAFG2THV_Jurkat/outs/metrics_summary.csv")
+
+cell_line_ab_metrics <- c("s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/210416_VH00296_5_AAAFG2THV_THP-1/outs/metrics_summary.csv",
+                          "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/210416_VH00296_5_AAAFG2THV_HL-60/outs/metrics_summary.csv",
+                          "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/210416_VH00296_5_AAAFG2THV_Molm-13/outs/metrics_summary.csv",
+                          "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/210416_VH00296_5_AAAFG2THV_Jurkat/outs/metrics_summary.csv")
+
+cell_line_ab_metrics <- lapply(ab_metrics, function(arg) aws.s3::s3read_using(object = arg, FUN = readr::read_csv))
+cell_line_ab_metrics <- do.call("rbind", cell_line_ab_metrics) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate_all(.funs = function(arg) gsub("%", "", arg)) %>%
+  dplyr::mutate_if(is.character, .funs = as.numeric) %>%
+  dplyr::mutate(sample_id = c("THP1", "HL60", "Molm13", "Jurkat"))
+
+training_data <- cell_line_ab_metrics %>% 
+  dplyr::right_join(fi_comdata, by = c("sample_id"))
+
+training_data_for_model <- training_data %>%
+  dplyr::select(-sample_id, -ag, -quantile)
+
+set.seed(69420)                                                         
+myfit <- randomForest::randomForest(abc_flow ~ ., data = training_data_for_model, ntree = 1000, type = "regression")
+
+
+
+
+
+
+
+
+
+# Test on separate CITEseq dataset (SCSEQ-NTD-210416)
+# experiment <- "single_cell/internal/SCSEQ-NTD-210416"
+# 
+# cell_line_paths <- aws.s3::get_bucket(bucket = "vorbio-analysis", prefix = experiment, max = Inf)
+# cell_line_paths <- lapply(cell_line_paths, `[`, 1) %>% unlist()
+# cell_line_paths <- cell_line_paths[grepl("Jurkat|Molm-13|HL-60|THP-1", cell_line_paths, ignore.case = TRUE)]
+# cell_line_paths <- cell_line_paths[!grepl("reanalyzed|aggregated", cell_line_paths, ignore.case = TRUE)]
+# 
+# bg_matrix <- lapply(c("Jurkat", "Molm-13", "HL-60", "THP-1"), function(arg) {
+#   
+#   cell_line_matrix <- cell_line_paths[grepl("raw_feature_bc_matrix.h5", cell_line_paths) & grepl(arg, cell_line_paths, ignore.case = TRUE)]
+#   cell_line_matrix <- cell_line_matrix[grepl("outs", cell_line_matrix)]
+#   cell_line_matrix <- aws.s3::s3read_using(FUN = Read10X_h5, 
+#                                            object = paste0("s3://vorbio-analysis/", cell_line_matrix))[["Antibody Capture"]]
+#   colnames(cell_line_matrix) <- paste(colnames(cell_line_matrix), arg, sep = "_")
+#   return(cell_line_matrix)
+#   
+# })
+# bg_matrix <- do.call("cbind", bg_matrix)
+# 
+# cell_protein_matrix <- lapply(c("Jurkat", "Molm-13", "HL-60", "THP-1"), function(arg) {
+#   
+#   cell_line_matrix <- cell_line_paths[grepl("filtered_feature_bc_matrix.h5", cell_line_paths) & grepl(arg, cell_line_paths)]
+#   cell_line_matrix <- aws.s3::s3read_using(FUN = Read10X_h5, 
+#                                            object = paste0("s3://vorbio-analysis/", cell_line_matrix))[["Antibody Capture"]]
+#   colnames(cell_line_matrix) <- paste(colnames(cell_line_matrix), arg, sep = "_")
+#   return(cell_line_matrix)
+#   
+# })
+# cell_protein_matrix <- do.call("cbind", cell_protein_matrix)
+# 
+# # keep only empty droplets for background matrix
+# bg_matrix <- bg_matrix[, !colnames(bg_matrix) %in% colnames(cell_protein_matrix)]
+# # remove droplets with zero signal
+# bg_matrix <- bg_matrix[, colSums(bg_matrix) > nrow(bg_matrix)]
+# # remove droplets near filter threshold based on histogram of droplet count sums
+# #bg_matrix <- bg_matrix[, colSums(bg_matrix) < 1000]
+# 
+# stopifnot(all(rownames(bg_matrix) %in% rownames(cell_protein_matrix)))
+# 
+# # normalize and de-noise with dsb
+# dsb_norm_mat <- dsb::DSBNormalizeProtein(
+#   
+#   cell_protein_matrix = cell_protein_matrix, 
+#   empty_drop_matrix = bg_matrix, 
+#   denoise.counts = FALSE, 
+#   use.isotype.control = FALSE, 
+#   #isotype.control.name.vec = c("IgG1_K_Isotype_TotalSeqC", "IgG2a_K_Isotype_TotalSeqC"),
+#   #isotype.control.name.vec = c("IgG1_K_Isotype_TotalSeqC"),
+#   pseudocount.use = 1,
+#   quantile.clipping = TRUE,
+# 
+# )
+# 
+# cell_line_ab_metrics <- c("s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/210416_VH00296_5_AAAFG2THV_THP-1/outs/metrics_summary.csv",
+#                           "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/210416_VH00296_5_AAAFG2THV_HL-60/outs/metrics_summary.csv",
+#                           "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/210416_VH00296_5_AAAFG2THV_Molm-13/outs/metrics_summary.csv",
+#                           "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/210416_VH00296_5_AAAFG2THV_Jurkat/outs/metrics_summary.csv")
+# 
+# cell_line_ab_metrics <- lapply(ab_metrics, function(arg) aws.s3::s3read_using(object = arg, FUN = readr::read_csv))
+# cell_line_ab_metrics <- do.call("rbind", cell_line_ab_metrics) %>%
+#   janitor::clean_names() %>%
+#   dplyr::mutate_all(.funs = function(arg) gsub("%", "", arg)) %>%
+#   dplyr::mutate_if(is.character, .funs = as.numeric) %>%
+#   dplyr::mutate(sample_id = c("THP1", "HL60", "Molm13", "Jurkat"))
+
+#dsb_norm_mat_qn <- limma::normalizeQuantiles(dsb_norm_mat)
+#dsb_norm_mat_qn <- qn_data <- limma::removeBatchEffect(x = dsb_norm_mat, covariates = colSums(cell_protein_matrix))
+
+input_data <- blast_df %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("barcode") %>%
+  dplyr::mutate(sample_id = gsub(".*_|-", "", barcode)) %>%
+  dplyr::left_join(cell_line_ab_metrics, by = "sample_id")
+
+tic()
+myfeats <- c("CD33", "CLL1", "CD123")
+imputed_abc <- foreach(arg = myfeats, .combine = "cbind", .inorder = TRUE, .packages = c("randomForest", "e1071",  "dplyr")) %dopar% {
+  
+  newdata <- input_data
+  colnames(newdata)[colnames(newdata) == arg] <- "abc_adt"
+  mypred <- predict(myfit, newdata = newdata)
+  mypred <- 10^mypred
+  mypred <- data.frame(mypred)
+  colnames(mypred) <- arg
+  return(mypred)
+  
+}
+toc()
+
+imputed_abc <- imputed_abc %>%
+  dplyr::mutate(barcode = input_data$barcode) %>%
+  dplyr::mutate(sample_id = gsub(".*_|-", "", barcode))
+
+boxplot(CD33 ~ sample_id, data = imputed_abc)
+boxplot(CD123 ~ sample_id, data = imputed_abc)
+boxplot(CLL1 ~ sample_id, data = imputed_abc)
+
+boxplot(IgG1_K_Isotype_TotalSeqC ~ sample_id, data = imputed_abc)
+boxplot(IgG2a_K_Isotype_TotalSeqC ~ cell_line, data = imputed_abc)
+
+
+# aws.s3::s3read_using(FUN = pzfx::read_pzfx, 
+#                      object = "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210416/20210416_CD33_CLL1_CD123_quantibrite analysis_cell lines.pzfx")
+# 
+# aws.s3::s3read_using(FUN = pzfx::read_pzfx, 
+#                      object = "s3://vorbio-analysis/single_cell/internal/SCSEQ-NTD-210525/20210514_CD33_CLL1_CD123_quantibrite analysis_cell lines.pzfx")
+
+```
