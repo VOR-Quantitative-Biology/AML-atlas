@@ -1,0 +1,557 @@
+---
+title: "Aggregating AML samples into v5 object"
+author: "Matt Ung and Alyssa Pyclik"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    code_folding: hide
+    theme: yeti
+    toc: true
+    number_sections: true
+---
+
+```{r setup}
+
+library(SeuratObject)
+library(dplyr)
+library(BPCells)
+library(aws.s3)
+library(Seurat)
+library(tibble)
+library(tidyr)
+library(glue)
+library(dotenv)
+library(stringr)
+library(lubridate)
+library(tidyseurat)
+library(readr)
+library(stringr)
+
+knitr::opts_knit$set(root.dir = '/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas')
+
+dotenv::load_dot_env(file = "/home/rstudio/data/bitbucket/.env")
+
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = Sys.getenv("key"),
+  "AWS_SECRET_ACCESS_KEY" = Sys.getenv("secret"),
+  "AWS_DEFAULT_REGION" = "us-east-1"
+)
+
+options(Seurat.object.assay.version = "v5")
+
+```
+
+#### Formatting Functions
+```{r format_functions}
+
+# Get Formatted Patient ID's  -------------------------
+get_pt_lbls <- function(x) {
+  cols <- unlist(strsplit(x, split = '/'))[7]
+  cols <- paste0("Patient_", str_remove_all(cols, ".*Patient(_|-)"))
+  cols <- stringr::str_replace(cols, "-", "_")
+  return(cols)
+}
+
+# Get Pt Number -------------------------
+get_fpth_pts <- function(x) {
+  if (grepl("Patient", x)) {
+    
+    pts <- unlist(str_split(x, "/"))[[4]]
+    pts <- stringr::str_remove(pts, ".*Patient(_|-)")
+    
+  } else if (grepl("Donor", x)) {
+    
+    pts <- unlist(str_split(x, "/"))[[4]]
+    pts <- stringr::str_remove(pts, "AH_")
+    
+  }
+  
+  return(pts)
+}
+
+# Formatting BPCells directory names  -------------------------
+get_fpth_exp <- function(x) {
+  exp <-  stringr::str_replace_all(unlist(strsplit(x, split = '/'))[6], "_", "-")
+  full <- paste(exp, get_pt_lbls(x), "filtered_feature_bc_matrix.h5", sep = "_")
+  return(full)
+}
+
+# Find Duplicate Samples & keep newest  -------------------------
+rm_old_samples <- function(df) {
+  # Convert date column to Date type format & Sort df 
+  df$LastModified <- as.Date(df$LastModified) 
+  df <- df[order(df$Sample, df$LastModified, decreasing = TRUE), ]
+  # Filter duplicate samples by Last Modified 
+  duplicate_samples <- duplicated(df$Sample)
+  df <- df[!duplicate_samples, ]
+  return(df)
+}
+
+# Convert Ensemble ID's to HGNC symbol  -------------------------
+update_rna_feats <- function(oldrna) {
+  rnaref <- aws.s3::s3read_using(
+    read.csv, 
+    object = "s3://vorbio-bioinformatics/efs/reference/annotations/hg38/ensembl/biomart_gene_annotation_may2021.csv")
+  # filtering the rna reference df to include mydata feats
+  rna_ref <- rnaref[oldrna %in% rnaref$ensembl_gene_id, ]
+  
+  # Merge mapped & un-mapped gene ID's
+  rna_map_df <- data.frame(ensembl_gene_id = oldrna) %>%
+    dplyr::left_join(rna_ref, by= "ensembl_gene_id") %>%
+    # Convert un-mapped features to their Ensemble ID
+    dplyr::mutate(hgnc_symbol = case_when( 
+      nchar(hgnc_symbol) == 0 ~ ensembl_gene_id,
+      is.na(hgnc_symbol) ~ ensembl_gene_id,
+      # Add a deliminator to duplicate features
+      duplicated(hgnc_symbol) ~ paste0(hgnc_symbol, ".1"),  
+      TRUE ~ hgnc_symbol))
+  symb <- rna_map_df$hgnc_symbol
+  return(symb)
+}
+
+# Removing experiment info from ADT names  -------------------------
+update_adt_feats <- function(x) {
+  
+  adt_new <- stringr::str_replace_all(x, "_", "-") %>%
+    stringr::str_replace_all("Armernian", "Armenian") %>%
+    stringr::str_replace_all("CD371", "CLL1") %>%
+    stringr::str_remove_all("-totalseqC-(20220630|20221031|20221205)") %>%
+    toupper()
+  
+  return(adt_new)
+  
+}
+
+# Extract deletion information by cytogenetic information
+parse_deletions <- function(cyto_str) {
+ 
+    parsed_str <- unlist(strsplit(cyto_str, split = ","))
+    parsed_str <- parsed_str[grepl("-|del", parsed_str)]
+    parsed_str <- gsub("\\[.*", "", parsed_str)
+    
+    whole_chr <- parsed_str[grepl("^-", parsed_str)]
+    if (length(whole_chr) > 0) {
+      whole_chr <- paste0("chr", gsub("-", "", whole_chr))
+    }
+    
+    band <- parsed_str[grepl("del", parsed_str)]
+    band <- band[!band %in% "del(11(q23)"]
+    
+    cytoband <- lapply(band, function(mystr) {
+      
+      mychr <- gsub("\\).*", "", mystr)
+      mychr <- gsub(".*\\(", "", mychr)
+      mychr <- paste0("chr", mychr)
+      
+      arm <- unlist(strsplit(mystr, split = "\\)"))
+      arm <- arm[which(grepl("del", arm)) + 1]
+      arm <- gsub("\\(|-.*", "", arm)
+      
+      if (grepl("q", arm)) {
+        
+        # arm <- gsub("q", "_", arm)
+        # arm <- gsub("^_", "", arm)
+        arm <- gsub("^q", "", arm)
+        arm <- unlist(strsplit(arm, split = "q"))
+        arm <- sort(unique(arm))
+        if (length(arm) > 1) arm <- as.character(seq(arm[1], arm[2], 1))
+        arm <- paste0("q", arm)
+        
+      } else if (grepl("p", arm)) {
+        
+        # arm <- gsub("p", "_", arm)
+        # arm <- gsub("^_", "", arm)
+        arm <- gsub("^p", "", arm)
+        arm <- unlist(strsplit(arm, split = "p"))
+        arm <- sort(unique(arm))
+        if (length(arm) > 1) arm <- as.character(seq(arm[1], arm[2], 1))
+        arm <- paste0("p", arm)
+        
+      }
+      
+      cytoband <- paste0(mychr, arm)
+      return(cytoband)
+
+    }) %>% unlist()
+    
+    cytoband <- gsub("MLL-", "", cytoband)
+    cytoband <- paste(unique(c(whole_chr, cytoband)), collapse = ", ")
+    cytoband <- cytoband[!cytoband %in% ""]
+    if (length(cytoband) == 0) cytoband = NA
+    
+    return(cytoband)
+   
+}
+
+```
+
+### Function to merge samples into a Seurat v5 object
+
+```{r function_to_create_seurat_object}
+
+merge_aml_studies <- function(directory = "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat", 
+                              overwrite = TRUE,
+                              s3_df) {
+  
+    rna_data_list <- list()
+    adt_data_list <- list()
+    metadata_list <- list()
+    
+    sample_paths <- list.files(directory, full.names = TRUE, pattern = ".h5", recursive = TRUE)
+    
+    for (mypath in sample_paths) {
+
+        cat(mypath, "\n")
+        
+        sample_name <- gsub("_filtered_feature_bc_matrix.h5", "", basename(mypath))
+        # Create BP RNA matrices
+        data <- BPCells::open_matrix_10x_hdf5(mypath, feature_type = c("Gene Expression"))
+        mydir <- paste0(gsub(".h5", "", basename(mypath)), "_RNA_BP")
+         # hard code file name correction due to human error in file naming
+        mydir <- gsub("Patient_55", "Patient_56", mydir)
+        mydir <- gsub("Patient_21_Diagnosis", "Patient_21_Relapse", mydir)
+        mydir <- file.path(directory, mydir)
+        
+        BPCells::write_matrix_dir(mat = data, dir = mydir, overwrite = overwrite)
+        rna_mat <- BPCells::open_matrix_dir(dir = mydir)
+        colnames(rna_mat) <- paste0(colnames(rna_mat), "-", sample_name)
+
+        # Create BP ADT matrices
+        data <- BPCells::open_matrix_10x_hdf5(mypath, feature_type = c("Antibody Capture"))
+        mydir <- paste0(gsub(".h5", "", mypath), "_ADT_BP")
+        # hard code file name correction due to human error in file naming
+        mydir <- gsub("Patient_55", "Patient_56", mydir)
+        mydir <- gsub("Patient_21_Diagnosis", "Patient_21_Relapse", mydir)
+        
+        BPCells::write_matrix_dir(mat = data, dir = mydir, overwrite = overwrite)
+        adt_mat <- BPCells::open_matrix_dir(dir = mydir)
+        colnames(adt_mat) <- paste0(colnames(adt_mat), "-", sample_name)
+
+        # Get metadata
+        metadata_list[[sample_name]] <- data.frame(barcode = colnames(rna_mat), 
+                                                   sample_id = gsub(".*-", "", colnames(rna_mat))) %>%
+          dplyr::left_join(s3_df, by = "sample_id") %>%
+          dplyr::select(-sample_id)
+        
+        rownames(rna_mat) <- update_rna_feats(rownames(rna_mat))
+        rownames(adt_mat) <- update_adt_feats(rownames(adt_mat))
+        
+        rna_data_list[[sample_name]] <- rna_mat
+        adt_data_list[[sample_name]] <- adt_mat
+
+    }
+    
+    metadata <- Reduce("rbind", metadata_list)
+    
+    
+    # Create layered v5 seurat object
+    merged_object <- Seurat::CreateSeuratObject(
+      counts = rna_data_list, 
+      meta.data = metadata, 
+      min.cells = 0, 
+      min.features = 0,
+      assay = "RNA",
+      project = "aml_atlas"
+    )
+    
+    # Calculate mitochondrial gene composition and remove biologically irrelevant features
+    merged_object[["percent.mt"]] <- Seurat::PercentageFeatureSet(merged_object, pattern = "^MT-")
+    merged_object[["percent.malat1"]] <- Seurat::PercentageFeatureSet(merged_object, pattern = "MALAT1")
+    merged_object[["percent.rpl_rps"]] <- Seurat::PercentageFeatureSet(merged_object, pattern = "^RPL|^RPS")
+    
+    select_features <- rownames(merged_object@assays$RNA)[!grepl("^MT-|^RPS|^RPL|MALAT1", rownames(merged_object@assays$RNA))]
+    merged_object <- subset(merged_object, features = select_features)
+
+    merged_object[["ADT"]] <- SeuratObject::CreateAssay5Object(counts = adt_data_list)
+    merged_object <- merged_object %>% 
+      dplyr::mutate(sample_id = paste(patient, time, sep = "_"))
+
+    return(merged_object)
+    
+}
+
+```
+
+### Organize S3 file paths and construct master clinical metadata table
+
+```{r metadata_aggregation_and_correction}
+
+# Get file paths
+key_pattern <- "Patient|AH_Patient|AH-Patient|AH_Donor|JD_Healthy"
+db <- aws.s3::get_bucket_df(bucket = 's3://vorbio-analysis', prefix = 'single_cell/internal/', max = Inf) %>%
+  dplyr::filter(grepl("filtered_feature_bc_matrix.h5", Key), grepl(key_pattern, Key))
+
+fpath_df <- db %>%
+  dplyr::mutate(Sample = unname(sapply(Key, get_fpth_pts)),
+                Sample = dplyr::case_when(Sample %in% "55_6D" ~ "56_6D", # hard code correction of file mislabeling
+                                          Sample %in% "55_6R" ~ "56_6R",
+                                          TRUE ~ Sample)) %>%
+  dplyr::filter(!grepl("NTD|CellHash", Key)) %>%
+  dplyr::mutate(Patient = ifelse(stringr::str_detect(Sample, "Donor"), Sample, paste0("Patient_", gsub("_", "", substr(Sample, 1, 2)))),
+                Time = dplyr::case_when(stringr::str_detect(Sample, "Donor|Healthy") ~ "Healthy",
+                                        Patient %in% "Patient_21" ~ "Relapse", # hard code correction of file mislabeling
+                                        TRUE ~ ifelse(grepl("D", Sample), "Diagnosis", "Relapse")))
+
+fpath_df <- fpath_df %>%
+  dplyr::mutate(sample_id = paste(Patient, Time, sep = "_"),
+                LastModified = as.Date(LastModified)) %>%
+  dplyr::select(sample_id, Patient, Time, Key, Bucket, LastModified) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::slice(which.max(LastModified)) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(Patient)
+
+# Get sample Cellranger metrics
+metrics_db <- aws.s3::get_bucket_df(bucket = 's3://vorbio-analysis', 
+                                    prefix = 'single_cell/internal/', 
+                                    max = Inf) %>%
+  dplyr::filter(grepl("metrics_summary.csv", Key), 
+                grepl(key_pattern, Key))
+
+metrics_df <- metrics_db %>%
+  dplyr::mutate(Sample = unname(sapply(Key, get_fpth_pts)),
+                Sample = case_when(Sample %in% "55_6D" ~ "56_6D", # hard code correction to file mislabeling
+                                   Sample %in% "55_6R" ~ "56_6R",
+                                   TRUE ~ Sample)) %>%
+  dplyr::filter(!grepl("NTD|CellHash", Key)) %>%
+  dplyr::mutate(Patient = ifelse(str_detect(Sample, "Donor"), Sample, paste0("Patient_", gsub("_", "", substr(Sample, 1, 2)))),
+                Time = case_when(str_detect(Sample, "Donor") ~ "Healthy",
+                                 Patient %in% "Patient_21" ~ "Relapse", # Hard code this to correct error in sample file naming
+                                 TRUE ~ ifelse(grepl("D", Sample), "Diagnosis", "Relapse"))) %>%
+  dplyr::mutate(sample_id = paste(Patient, Time, sep = "_"),
+                LastModified = as.Date(LastModified)) %>%
+  dplyr::select(sample_id, Patient, Time, Key, Bucket, LastModified) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::slice(which.max(LastModified)) %>%
+  dplyr::ungroup() %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(aws.s3::s3read_using(FUN = readr::read_csv, object = file.path("s3://", Bucket, Key))) %>%
+  dplyr::select(-Key, -Bucket, -LastModified)
+
+metrics_df <- dplyr::mutate_if(metrics_df, 
+                               .predicate = apply(metrics_df, 2, function(arg) sum(grepl("%", arg))) > 0, 
+                               .funs = function(arg) num(as.numeric(gsub("%", "", arg)), label = "%"))
+
+colnames(metrics_df) <- gsub("antibody_antibody", "antibody", colnames(metrics_df))
+
+# Add clinical metadata
+uhn_metadata <- aws.s3::s3read_using(
+  FUN = readr::read_csv, trim_ws = TRUE, skip_empty_rows = TRUE,
+  object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/uhn_metadata_v2.csv"
+) %>%
+  janitor::clean_names() %>%
+  dplyr::select(patient_id, sample_status, initial_tx, response_to_initial_tx, vital_status, date_of_death_or_last_follow_up) %>%
+  dplyr::mutate_if(.predicate = grepl("date", colnames(.), ignore.case = TRUE), .funs = function(arg) lubridate::as_date(lubridate::my(arg))) %>%
+  dplyr::mutate(sample_status = ifelse(grepl("relapse", sample_status, ignore.case = TRUE), "relapse", "dx")) %>%
+  dplyr::distinct()
+
+dme_metadata <- aws.s3::s3read_using(
+  FUN = readr::read_csv, trim_ws = TRUE, skip_empty_rows = TRUE,
+  object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/patient_metadata_DME_v4.csv"
+) %>%
+  janitor::clean_names() %>%
+  dplyr::rename(vor_patient_id = patient_id_vor_nomenclature,
+                blast_percent = blasts_percent,
+                hsct = groups_1_5_are_hct_1_dx_bm_relapse_bm_2_dx_bm_relapse_pb_3_dx_pb_relapse_bm_4_dx_pb_relapse_pb_5_relapse_only_samples_bm_group_6_no_hct_dx_bm_and_relapse_bm) %>%
+  dplyr::mutate(blast_percent_min = as.numeric(gsub("~|>|-.*", "", blast_percent)),
+                hsct = ifelse(hsct %in% c(1:5), "HSCT", "none"),
+                sample_status = gsub(" .*", "", sample_status)) %>%
+  dplyr::select(-cell_concentration_vial) %>%
+  dplyr::mutate_if(.predicate = grepl("date", colnames(.), ignore.case = TRUE), .funs = function(arg) lubridate::as_date(lubridate::ym(arg))) %>%
+  dplyr::mutate(mll = ifelse(sample_status %in% "relapse", NA, mll),
+                npm1 = ifelse(sample_status %in% "relapse", NA, npm1),
+                flt3_itd = ifelse(sample_status %in% "relapse", NA, flt3_itd),
+                flt3_tkd = ifelse(sample_status %in% "relapse", NA, flt3_tkd),
+                kit = ifelse(sample_status %in% "relapse", NA, kit),
+                runx1 = ifelse(sample_status %in% "relapse", NA, runx1),
+                tp53 = ifelse(sample_status %in% "relapse", NA, tp53),
+                asxl1 = ifelse(sample_status %in% "relapse", NA, asxl1),
+                other_mutations_ngs = ifelse(sample_status %in% "relapse", NA, other_mutations_ngs)) %>%
+  dplyr::mutate(cytogenetics = ifelse(sample_status %in% "dx", cytogenetics_1, cytogenetics_2),
+                date_of_cytogenetics = lubridate::as_date(ifelse(sample_status %in% "dx", date_of_cytogenetics_1, date_of_cytogenetics_2))) %>%
+  dplyr::select(-cytogenetics_1, -cytogenetics_2, -date_of_cytogenetics_1, -date_of_cytogenetics_2) %>%
+  dplyr::filter(source %in% "BM")
+
+stopifnot(nrow(dplyr::filter(dme_metadata, sample_status %in% "relapse", grepl("D$", vor_patient_id))) == 1)
+
+# add blast metadata
+blast_data <- aws.s3::s3read_using(FUN = readr::read_csv, 
+                                   object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/vor_aml_sample_blast_percent.csv") %>%
+  dplyr::mutate(vor_patient_id = paste0("Patient ", vor_patient_id)) 
+
+flow_blast <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                   object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/ag_density_blast.csv") %>%
+  dplyr::mutate(vor_patient_id = paste0("Patient ", vor_patient_id)) 
+
+flow_lsc <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                   object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/ag_density_lsc.csv") %>%
+  dplyr::mutate(vor_patient_id = paste0("Patient ", vor_patient_id)) 
+
+# add LSC metadata
+lsc_metadata <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                     object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/LSC_percentage_BM.csv") %>%
+  dplyr::mutate(vor_patient_id = paste0("Patient ", sample_id)) %>%
+  dplyr::select(-sample_id)
+
+dme_metadata <- dplyr::left_join(dme_metadata, blast_data, by = "vor_patient_id") %>%
+  dplyr::left_join(flow_blast, by = "vor_patient_id") %>%
+  dplyr::left_join(flow_lsc, by = "vor_patient_id") %>%
+  dplyr::left_join(lsc_metadata, by = "vor_patient_id")
+
+# extract chromosome deletion information
+dme_metadata <- dme_metadata %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(deletions = parse_deletions(cytogenetics)) %>%
+  dplyr::ungroup()
+
+# join with UHN data
+clinical_metadata <- dplyr::left_join(dme_metadata, 
+                                      uhn_metadata, 
+                                      by = c("patient_id", "sample_status"), 
+                                      relationship = "one-to-one") %>%
+  dplyr::rename(uhn_patient_id = patient_id) %>%
+  dplyr::select(vor_patient_id, 
+                uhn_patient_id,
+                source, 
+                collection_date, 
+                blast_percent,
+                blast_percent_min,
+                everything()) %>%
+  dplyr::mutate(tmp_id = gsub("-.*", "", vor_patient_id),
+                tmp_id = gsub(" ", "_", tmp_id),
+                sample_status = dplyr::case_when(grepl("relapse", sample_status, ignore.case = TRUE) ~ "Relapse",
+                                                 grepl("dx", sample_status, ignore.case = TRUE) ~ "Diagnosis"),
+                tmp_id = paste(tmp_id, stringr::str_to_title(sample_status), sep = "_"),
+                blast_percent_min = num(blast_percent_min, label = "%"))
+
+# add sample viability metadata
+viability_data <- aws.s3::s3read_using(FUN = readr::read_csv, 
+                                       object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/vor_aml_sample_viability.csv")
+
+clinical_metadata <- dplyr::left_join(clinical_metadata, viability_data, by = c("tmp_id" = "sample_id"))
+
+fpath_df <- dplyr::left_join(fpath_df, clinical_metadata, by = c("sample_id" = "tmp_id")) %>%
+  dplyr::left_join(metrics_df, by = c("sample_id", "Patient", "Time")) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(vor_patient_id = ifelse(is.na(vor_patient_id), "Healthy", vor_patient_id)) %>%
+  dplyr::filter(lubridate::as_date(last_modified) >= lubridate::as_date("2023/1/1")) %>%
+  tidyr::unite(col = "key", bucket, key, sep = "/") %>%
+  dplyr::mutate(deletions = na_if(deletions, "NA")) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(deletions = case_when(is.na(deletions) ~ NA, TRUE ~ deletions)) %>%
+  dplyr::ungroup()
+
+stopifnot(all(!is.na(fpath_df$antibody_fraction_antibody_reads_in_aggregate_barcodes)))
+
+aws.s3::s3write_using(fpath_df, 
+                      FUN = readr::write_csv, 
+                      object = glue::glue("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_atlas_sample_metadata_{Sys.Date()}.csv"))
+
+```
+
+### Create v5 object and save .rds
+
+```{r save_seurat_object}
+
+output_dir <- glue::glue("/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat_{Sys.Date()}")
+
+# download count matrices
+for (path in 1:length(fpath_df$key)) {
+  system(glue::glue("aws s3 cp s3://{fpath_df$key[path]} {output_dir}/{fpath_df$patient[path]}_{fpath_df$time[path]}_filtered_feature_bc_matrix.h5"))
+}
+
+# create v5 object
+mydata <- merge_aml_studies(s3_df = fpath_df, 
+                            overwrite = TRUE,
+                            directory = output_dir)
+
+saveRDS(object = mydata, file = file.path(output_dir, "aml_atlas_layered_seurat.rds"))
+
+# there is a bug in this function. wait until devs publish fix (comment written on 2024-03-21).
+# SeuratObject::SaveSeuratRds(
+#   object = mydata, 
+#   file = file.path(output_dir, "aml_atlas_layered_seurat.rds")
+# )
+
+orig_data <- SeuratObject::LoadSeuratRds(file = file.path(output_dir, "aml_atlas_layered_seurat.rds"))
+dim(orig_data)
+orig_data@assays
+
+```
+
+### Output individual Seurat objects for LLM 
+```{r save_seurat_objects}
+
+options(Seurat.object.assay.version = "v3")
+directory <- "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat"
+sample_paths <- list.files(directory, full.names = TRUE, pattern = ".h5", recursive = TRUE)
+  
+for (mypath in sample_paths) {
+
+    cat(mypath, "\n")
+    
+    sample_name <- gsub("_filtered_feature_bc_matrix.h5", "", basename(mypath))
+    # hard code file name correction due to human error in file naming
+    sample_name <- gsub("Patient_55", "Patient_56", sample_name)
+    sample_name <- gsub("Patient_21_Diagnosis", "Patient_21_Relapse", sample_name)
+    
+    data_list <- Seurat::Read10X_h5(mypath)
+
+    # RNA
+    rna_mat <- data_list[["Gene Expression"]]
+    colnames(rna_mat) <- paste0(colnames(rna_mat), "-", sample_name)
+
+    # ADT
+    adt_mat <- data_list[["Antibody Capture"]]
+    colnames(adt_mat) <- paste0(colnames(adt_mat), "-", sample_name)
+
+    # Get metadata
+    metadata <- data.frame(barcode = colnames(rna_mat), 
+                           sample_id = gsub(".*-", "", colnames(rna_mat))) %>%
+      dplyr::mutate(time = ifelse(grepl("Diagnosis", sample_id), "Diagnosis", "Relapse"),
+                    patient = gsub("_Relapse|_Diagnosis", "", sample_id))
+    
+    rownames(rna_mat) <- update_rna_feats(rownames(rna_mat))
+    rownames(adt_mat) <- update_adt_feats(rownames(adt_mat))
+    
+    # Create Seurat object
+    seurat_object <- Seurat::CreateSeuratObject(
+      counts = rna_mat, 
+      meta.data = metadata, 
+      min.cells = 0, # Set to zero to avoid cell subset conflict with ADT assay slot
+      min.features = 0,
+      assay = "RNA",
+      project = "aml_atlas"
+    )
+
+    # Calculate mitochondrial gene composition and remove biologically irrelevant features
+    seurat_object[["percent.mt"]] <- Seurat::PercentageFeatureSet(seurat_object, pattern = "^MT-")
+    seurat_object[["percent.malat1"]] <- Seurat::PercentageFeatureSet(seurat_object, pattern = "MALAT1")
+    seurat_object[["percent.rpl_rps"]] <- Seurat::PercentageFeatureSet(seurat_object, pattern = "^RPL|^RPS")
+    
+    select_features <- rownames(seurat_object@assays$RNA)[!grepl("^MT-|^RPS|^RPL|MALAT1", rownames(seurat_object@assays$RNA))]
+    seurat_object <- subset(seurat_object, features = select_features)
+    
+    # Add ADT assay
+    seurat_object[["ADT"]] <- SeuratObject::CreateAssayObject(counts = adt_mat)
+    
+    seurat_object <- dplyr::filter(seurat_object,
+                                   nCount_RNA > 500,
+                                   nFeature_RNA > 100,
+                                   percent.mt < 15)
+    
+    seurat_object <- NormalizeData(seurat_object, assay = "RNA")
+    seurat_object <- NormalizeData(seurat_object, assay = "ADT", normalization.method = "CLR", margin = 2)
+
+    save_location <- glue::glue("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/seurat_objects_for_LLM/{sample_name}.rds")
+    aws.s3::s3write_using(x = seurat_object, FUN = saveRDS, object = save_location)
+    
+}
+
+```
+
+```{r}
+
+
+```
+
