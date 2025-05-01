@@ -1,0 +1,816 @@
+---
+title: "Identify new targets and target combinations from machine learning ABC estimates"
+author: "Matt Ung"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    code_folding: hide
+    theme: yeti
+    toc: true
+    number_sections: true
+---
+
+
+```{r setup, include = FALSE}
+
+library(devtools)
+library(flowCore)
+library(SeuratObject)
+library(BPCells)
+library(Seurat)
+library(SeuratDisk)
+library(dplyr)
+library(aws.s3)
+library(tibble)
+library(tidyr)
+library(dotenv)
+library(ggplot2)
+library(ggpubr)
+library(glue)
+library(DoubletFinder)
+library(tidyseurat)
+library(pzfx)
+library(preprocessCore)
+library(pals)
+library(EnhancedVolcano)
+library(SeuratWrappers)
+library(alphahull)
+library(igraph)
+library(reticulate)
+library(viridis)
+library(msigdbr)
+library(GSVA)
+library(escape)
+library(dittoSeq)
+library(fgsea)
+library(GSEABase)
+library(ggbeeswarm)
+library(circlize)
+library(pheatmap)
+library(biomaRt)
+library(SingleCellExperiment)
+library(Matrix)
+library(stringr)
+library(ComplexHeatmap)
+library(future)
+library(circlize)
+library(msigdbr)
+library(survival)
+library(survminer)
+library(broom)
+library(scales)
+library(lubridate)
+library(future)
+library(ggsci)
+library(bazar)
+library(flowCore)
+library(mclust)
+library(doParallel)
+library(foreach)
+library(scales)
+library(tictoc)
+library(randomForest)
+library(e1071)
+library(survminer)
+library(robCompositions)
+
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 1e9)
+
+load_dot_env(file = "/home/rstudio/data/bitbucket/.env")
+
+knitr::opts_knit$set(root.dir = "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas")
+
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = Sys.getenv("key"),
+  "AWS_SECRET_ACCESS_KEY" = Sys.getenv("secret"),
+  "AWS_DEFAULT_REGION" = "us-east-1"
+)
+
+cl <- makeCluster(6)
+registerDoParallel(cl)
+
+```
+
+# Load data objects
+
+```{r load_objects}
+
+aml_data <- aws.s3::s3readRDS(object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/seurat_v5/seurat_2024-04-03/aml_data_v3.rds")
+
+patient_order <- c("P26", "P44", "P52", "P70", "P61", "P31", "P43", "P30", "P64", "P56", "P54", "P27", "P41", "P49", "P51", "P50", "P66", "P29", "P67", "P42", "P65", "P60", "P58", "P28", "P40", "P4") 
+patient_id_map <- data.frame(patient = patient_order, 
+                             patient_manuscript_id = paste0("P", 1:length(patient_order))) %>%
+  dplyr::mutate(patient = factor(patient, levels = patient_order),
+                patient_manuscript_id = ifelse(nchar(patient_manuscript_id) == 2, gsub("P", "P0", patient_manuscript_id), patient_manuscript_id),
+                patient_manuscript_id = factor(patient_manuscript_id, levels = patient_manuscript_id))
+
+aml_data <- aml_data %>%
+  dplyr::left_join(dplyr::mutate(patient_id_map, patient = gsub("^P", "Patient_", patient)), by = "patient") %>%
+  dplyr::mutate(sample_manuscript_id = ifelse(sample_status == "Diagnosis", paste0(patient_manuscript_id, "D"), paste0(patient_manuscript_id, "R")))
+
+blast_object <- dplyr::filter(aml_data, cell_state_harmony_rna %in% "Blast")
+
+lsc17 <- list(lsc17 = c("AKR1C3",
+                        "ARHGAP22",
+                        "TMEM259",
+                        "CD34",
+                        "CDK6",
+                        "CPXM1",
+                        "DNMT3B",
+                        "DPYSL3",
+                        "EMP1",
+                        "ADGRG1",
+                        "FAM30A",
+                        "LAPTM4B",
+                        "MMRN1",
+                        "BEX3",
+                        "NYNRIN",
+                        "SOCS2",
+                        "ZBTB46"))
+
+
+blast_object <- AddModuleScore(blast_object, 
+                               features = lsc17,
+                               assay = "RNA",
+                               name = "lsc17") %>%
+  dplyr::rename(lsc17 = lsc171)
+
+lscs <- blast_object$barcode[blast_object@assays$ADT@data["CD34", ] > 1 & blast_object@assays$ADT@data["CD38", ] < 1 & blast_object$lsc17 > 0]
+lsc_object <- dplyr::filter(blast_object, barcode %in% lscs)
+
+imputed_abc <- aws.s3::s3read_using(
+  FUN = read.csv, row.names = 1, check.names = FALSE,
+  object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/imputed_ag_density/imputed_ag_density_blasts_2024-12-19.csv", #manuscript
+  #object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/imputed_ag_density/imputed_ag_density_blasts_2025-03-15.csv",
+  #object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/imputed_ag_density/imputed_ag_density_blasts_2025-02-13.csv",
+  #object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/imputed_ag_density/imputed_ag_density_blasts_2025-03-17.csv"
+)
+
+colnames(imputed_abc) <- case_when(colnames(imputed_abc) == "CLL1" ~ "CLL-1",
+                                     colnames(imputed_abc) == "EMR2" ~ "ADGRE2",
+                                     colnames(imputed_abc) == "CD305" ~ "LAIR1",
+                                     colnames(imputed_abc) == "CD49D" ~ "ITGA4",
+                                     colnames(imputed_abc) == "CD205" ~ "DEC-205",
+                                     colnames(imputed_abc) == "CD85K" ~ "LILRB4",
+                                     colnames(imputed_abc) == "CD88" ~ "C5AR1",
+                                     colnames(imputed_abc) == "CD120B" ~ "TNFR2",
+                                     colnames(imputed_abc) == "CD135" ~ "FLT3",
+                                     colnames(imputed_abc) == "CD152" ~ "CTLA-4",
+                                     colnames(imputed_abc) == "CD200" ~ "OX2",
+                                     colnames(imputed_abc) == "CD266" ~ "DNAM-1",
+                                     colnames(imputed_abc) == "CD235A" ~ "GlyA",
+                                     colnames(imputed_abc) == "CD273" ~ "PD-L2",
+                                     colnames(imputed_abc) == "CD274" ~ "PD-L1",
+                                     colnames(imputed_abc) == "CD279" ~ "PD-1",
+                                     colnames(imputed_abc) == "CD366" ~ "Tim-3",
+                                   TRUE ~ colnames(imputed_abc))
+
+```
+
+# Rank ADT markers in blasts using normalized ADT without background correction
+## Diagnosis
+```{r heatmap_diagnosis_adt}
+
+diagnosis_blast_object <- dplyr::filter(blast_object, time == "Diagnosis")
+
+ag_rank <- AverageExpression(diagnosis_blast_object, 
+                             assays = "ADT", 
+                             features = rownames(diagnosis_blast_object@assays$ADT), 
+                             group.by = "patient_manuscript_id")$ADT
+
+ag_rank <- sort(rowMeans(ag_rank), decreasing = TRUE)
+heatmap_features <- names(ag_rank)
+heatmap_features <- heatmap_features[!grepl("isotype", heatmap_features, ignore.case = TRUE)]
+
+heatmap_object <- DoHeatmap(dplyr::filter(diagnosis_blast_object, barcode %in% sample(diagnosis_blast_object$barcode, 500)), 
+                            assay = "ADT",
+                            slot = "data",
+                            group.by = "patient_manuscript_id",
+                            features = heatmap_features) +
+  scale_fill_gradientn(colors = c("cornflowerblue", "white", "yellow"))
+
+heatmap_features <- dplyr::case_when(heatmap_features == "CLL1" ~ "CLL-1",
+                                     heatmap_features == "EMR2" ~ "ADGRE2",
+                                     heatmap_features == "CD305" ~ "LAIR1",
+                                     heatmap_features == "CD49D" ~ "ITGA4",
+                                     heatmap_features == "CD205" ~ "DEC-205",
+                                     heatmap_features == "CD85K" ~ "LILRB4",
+                                     heatmap_features == "CD88" ~ "C5AR1",
+                                     heatmap_features == "CD120B" ~ "TNFR2",
+                                     heatmap_features == "CD135" ~ "FLT3",
+                                     heatmap_features == "CD152" ~ "CTLA-4",
+                                     heatmap_features == "CD200" ~ "OX2",
+                                     heatmap_features == "CD266" ~ "DNAM-1",
+                                     heatmap_features == "CD235A" ~ "GlyA",
+                                     heatmap_features == "CD273" ~ "PD-L2",
+                                     heatmap_features == "CD274" ~ "PD-L1",
+                                     heatmap_features == "CD279" ~ "PD-1",
+                                     heatmap_features == "CD366" ~ "Tim-3",
+                                     TRUE ~ heatmap_features)
+
+heatmap_object$data <- heatmap_object$data %>%
+  dplyr::mutate(Feature = case_when(Feature == "CLL1" ~ "CLL-1",
+                                    Feature == "EMR2" ~ "ADGRE2",
+                                    Feature == "CD305" ~ "LAIR1",
+                                    Feature == "CD49D" ~ "ITGA4",
+                                    Feature == "CD205" ~ "DEC-205",
+                                    Feature == "CD85K" ~ "LILRB4",
+                                    Feature == "CD88" ~ "C5AR1",
+                                    Feature == "CD120B" ~ "TNFR2",
+                                    Feature == "CD135" ~ "FLT3",
+                                    Feature == "CD152" ~ "CTLA-4",
+                                    Feature == "CD200" ~ "OX2",
+                                    Feature == "CD266" ~ "DNAM-1",
+                                    Feature == "CD235A" ~ "GlyA",
+                                    Feature == "CD273" ~ "PD-L2",
+                                    Feature == "CD274" ~ "PD-L1",
+                                    Feature == "CD279" ~ "PD-1",
+                                    Feature == "CD366" ~ "Tim-3",
+                                    TRUE ~ Feature),
+                Feature = factor(Feature, levels = rev(heatmap_features)))
+
+heatmap_features_dx <- heatmap_features
+heatmap_object
+                                  
+
+```
+
+## Relapse
+```{r heatmap_relapse_adt}
+
+relapse_blast_object <- dplyr::filter(blast_object, time == "Relapse")
+
+ag_rank <- AverageExpression(relapse_blast_object, 
+                             assays = "ADT", 
+                             features = rownames(relapse_blast_object@assays$ADT), 
+                             group.by = "patient_manuscript_id")$ADT
+
+ag_rank <- sort(rowMeans(ag_rank), decreasing = TRUE)
+heatmap_features <- names(ag_rank)
+heatmap_features <- heatmap_features[!grepl("isotype", heatmap_features, ignore.case = TRUE)]
+
+heatmap_object <- DoHeatmap(dplyr::filter(relapse_blast_object, barcode %in% sample(relapse_blast_object$barcode, 500)), 
+          assay = "ADT",
+          slot = "data",
+          group.by = "patient_manuscript_id",
+          features = heatmap_features) +
+  scale_fill_gradientn(colors = c("cornflowerblue", "white", "yellow"))
+
+heatmap_features <- dplyr::case_when(heatmap_features == "CLL1" ~ "CLL-1",
+                                     heatmap_features == "EMR2" ~ "ADGRE2",
+                                     heatmap_features == "CD305" ~ "LAIR1",
+                                     heatmap_features == "CD49D" ~ "ITGA4",
+                                     heatmap_features == "CD205" ~ "DEC-205",
+                                     heatmap_features == "CD85K" ~ "LILRB4",
+                                     heatmap_features == "CD88" ~ "C5AR1",
+                                     heatmap_features == "CD120B" ~ "TNFR2",
+                                     heatmap_features == "CD135" ~ "FLT3",
+                                     heatmap_features == "CD152" ~ "CTLA-4",
+                                     heatmap_features == "CD200" ~ "OX2",
+                                     heatmap_features == "CD266" ~ "DNAM-1",
+                                     heatmap_features == "CD235A" ~ "GlyA",
+                                     heatmap_features == "CD273" ~ "PD-L2",
+                                     heatmap_features == "CD274" ~ "PD-L1",
+                                     heatmap_features == "CD279" ~ "PD-1",
+                                     heatmap_features == "CD366" ~ "Tim-3",
+                                     TRUE ~ heatmap_features)
+
+heatmap_object$data <- heatmap_object$data %>%
+  dplyr::mutate(Feature = case_when(Feature == "CLL1" ~ "CLL-1",
+                                    Feature == "EMR2" ~ "ADGRE2",
+                                    Feature == "CD305" ~ "LAIR1",
+                                    Feature == "CD49D" ~ "ITGA4",
+                                    Feature == "CD205" ~ "DEC-205",
+                                    Feature == "CD85K" ~ "LILRB4",
+                                    Feature == "CD88" ~ "C5AR1",
+                                    Feature == "CD120B" ~ "TNFR2",
+                                    Feature == "CD135" ~ "FLT3",
+                                    Feature == "CD152" ~ "CTLA-4",
+                                    Feature == "CD200" ~ "OX2",
+                                    Feature == "CD266" ~ "DNAM-1",
+                                    Feature == "CD235A" ~ "GlyA",
+                                    Feature == "CD273" ~ "PD-L2",
+                                    Feature == "CD274" ~ "PD-L1",
+                                    Feature == "CD279" ~ "PD-1",
+                                    Feature == "CD366" ~ "Tim-3",
+                                    TRUE ~ Feature),
+                Feature = factor(Feature, levels = rev(heatmap_features)))
+
+heatmap_features_re <- heatmap_features
+
+heatmap_object
+                                  
+
+```
+
+# Rank ADT markers in blasts using estimated surface counts
+## All blasts
+### Diagnosis
+```{r heatmap_diagnosis}
+
+markers_remove <- c("ISOTYPE-IGG1K", "ISOTYPE-RAT", "ISOTYPE-ARMENIAN-HAMSTER", "CD4", "CD4B", "CD3", "CD8", "CD8A", "CD19", "CD5", "CD71", "CD235A", "CD22")
+
+heatmap_features <- imputed_abc %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", sample_id)) %>%
+  dplyr::filter(grepl("Diagnosis", sample_id)) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::summarize_all(median) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-sample_id)
+
+heatmap_features <- sort(colMedians(as.matrix(heatmap_features)), decreasing = TRUE)
+heatmap_features <- heatmap_features[!grepl("isotype", heatmap_features, ignore.case = TRUE)]
+heatmap_features <- heatmap_features[!names(heatmap_features) %in% markers_remove]
+
+
+
+
+set.seed(465)
+cell_sample <- sample(colnames(diagnosis_blast_object), 5000)
+stopifnot(all(unique(gsub(".*-", "", cell_sample)) %in% unique(diagnosis_blast_object$sample_id)))
+myheat <- t(imputed_abc) %>% as.matrix
+# myheat[myheat < 1000] <- -1
+# myheat[myheat > 1000 & myheat < 5000] <- 0
+# myheat[myheat > 5000] <- 1
+
+# choose ranking methodology
+myheat <- myheat[names(heatmap_features), cell_sample]
+
+patient_colors <- pals::glasbey()
+names(patient_colors) <- unique(diagnosis_blast_object$patient_manuscript_id)
+patient_colors <- patient_colors[!is.na(names(patient_colors))]
+
+col_split <- gsub(".*-|_Diagnosis", "", colnames(myheat))
+col_split <- gsub("Patient_", "P", col_split)
+col_split <- unlist(lapply(col_split, function(arg) patient_id_map$patient_manuscript_id[patient_id_map$patient == arg]))
+col_split <- factor(col_split, levels = sort(unique(col_split)))
+
+ha <- HeatmapAnnotation("Patient" = col_split,
+                        col = list(`Patient` = patient_colors),
+                        show_annotation_name = TRUE)
+
+col_fun <- colorRamp2(c(0, 5000), c("white", "red"))
+
+myheat_top <- myheat[1:25, ]
+row_split <- rownames(myheat_top)
+num <- 1
+for (i in 1:length(row_split)) {
+  if (!row_split[i] %in% c("CD33", "CLL1", "CD305", "CD49D", "CD205", "CD244")) {
+    row_split[i] <- num
+  } else {
+    num <- num + 1
+    row_split[i] <- num
+    num <- num + 1
+  }
+}
+
+
+
+ComplexHeatmap::Heatmap(
+  myheat_top,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  row_names_side = "right",
+  top_annotation = ha,
+  column_split = col_split,
+  column_gap = unit(0.8, "mm"),
+  row_gap = unit(1, "mm"),
+  col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 15),
+  #row_split = row_split,
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  use_raster = FALSE
+)
+
+myheat_bot <- myheat[21:nrow(myheat), ]
+ComplexHeatmap::Heatmap(
+  myheat_bot,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  top_annotation = ha,
+  column_split = col_split,
+  column_gap = unit(1, "mm"),
+  col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 10),
+  border = TRUE
+)
+
+
+```
+
+### Relapse
+```{r heatmap_relapse}
+
+markers_remove <- c("ISOTYPE-IGG1K", "ISOTYPE-RAT", "ISOTYPE-ARMENIAN-HAMSTER", "CD4", "CD4B", "CD3", "CD8", "CD8A", "CD19", "CD5", "CD71", "CD235A", "CD22")
+
+heatmap_features <- imputed_abc %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", sample_id)) %>%
+  dplyr::filter(grepl("Relapse", sample_id)) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::summarize_all(median) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-sample_id)
+
+heatmap_features <- sort(colMedians(as.matrix(heatmap_features)), decreasing = TRUE)
+heatmap_features <- heatmap_features[!grepl("isotype", heatmap_features, ignore.case = TRUE)]
+stopifnot(all(unique(gsub(".*-", "", cell_sample)) %in% unique(diagnosis_blast_object$sample_id)))
+heatmap_features <- heatmap_features[!names(heatmap_features) %in% markers_remove]
+
+
+set.seed(465)
+cell_sample <- sample(colnames(relapse_blast_object), 5000)
+
+myheat <- t(imputed_abc) %>% as.matrix
+
+#ranking methodology
+myheat <- myheat[names(heatmap_features), cell_sample]
+
+patient_colors <- pals::glasbey()
+names(patient_colors) <- unique(relapse_blast_object$patient_manuscript_id)
+patient_colors <- patient_colors[!is.na(names(patient_colors))]
+
+col_split <- gsub(".*-|_Relapse", "", colnames(myheat))
+col_split <- gsub("Patient_", "P", col_split)
+col_split <- unlist(lapply(col_split, function(arg) patient_id_map$patient_manuscript_id[patient_id_map$patient == arg]))
+col_split <- factor(col_split, levels = sort(unique(col_split)))
+
+ha <- HeatmapAnnotation("Patient" = col_split,
+                        col = list(`Patient` = patient_colors),
+                        show_annotation_name = TRUE)
+
+col_fun <- colorRamp2(c(0, 5000), c("white", "red"))
+
+myheat_top <- myheat[1:25, ]
+row_split <- rownames(myheat_top)
+num <- 1
+for (i in 1:length(row_split)) {
+  if (!row_split[i] %in% c("CD33", "CLL1", "CD305", "CD49D", "CD205", "CD244")) {
+    row_split[i] <- num
+  } else {
+    num <- num + 1
+    row_split[i] <- num
+    num <- num + 1
+  }
+}
+
+ComplexHeatmap::Heatmap(
+  myheat_top,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  row_names_side = "right",
+  top_annotation = ha,
+  column_split = col_split,
+  column_gap = unit(1, "mm"),
+  row_gap = unit(1, "mm"),
+  col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 15),
+  #row_split = row_split,
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  use_raster = FALSE
+)
+
+myheat_bot <- myheat[21:nrow(myheat), ]
+ComplexHeatmap::Heatmap(
+  myheat_bot,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  top_annotation = ha,
+  column_split = col_split,
+  column_gap = unit(1, "mm"),
+  col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 10),
+  border = TRUE
+)
+
+```
+
+
+## LSCs 
+### Diagnosis
+```{r heatmap_diagnosis}
+
+diagnosis_lsc_object <- dplyr::filter(lsc_object, time == "Diagnosis")
+
+heatmap_features <- imputed_abc %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::filter(sample_id %in% colnames(diagnosis_lsc_object), grepl("Diagnosis", sample_id)) %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", sample_id)) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::summarize_all(median) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-sample_id)
+
+heatmap_features <- sort(colMedians(as.matrix(heatmap_features)), decreasing = TRUE)
+heatmap_features <- names(heatmap_features)
+heatmap_features <- heatmap_features[!grepl("isotype", heatmap_features, ignore.case = TRUE)]
+
+set.seed(465)
+cell_sample <- lapply(unique(diagnosis_lsc_object$patient), function(arg) {
+  tmp <- dplyr::filter(diagnosis_lsc_object, patient %in% arg) %>%
+    dplyr::pull(barcode)
+  tmp <- sample(tmp, min(length(tmp), 100))
+  return(tmp)
+}) %>% unlist()
+stopifnot(all(unique(gsub(".*-", "", cell_sample)) %in% unique(diagnosis_lsc_object$sample_id)))
+
+markers_remove <- c("ISOTYPE-IGG1K", "ISOTYPE-RAT", "ISOTYPE-ARMENIAN-HAMSTER", "CD34", "CD4", "CD4B", "CD3", "CD8", "CD8A", "CD19", "CD14", "CD15", "CD16", "CD11C", "CD5", "CD38", "CD45", "CD9")
+markers_remove <- c("ISOTYPE-IGG1K", "ISOTYPE-RAT", "ISOTYPE-ARMENIAN-HAMSTER", "CD4", "CD4B", "CD3", "CD8", "CD8A", "CD19", "CD5", "CD71", "CD235A", "CD22")
+
+heatmap_features <- heatmap_features[!heatmap_features %in% markers_remove]
+
+myheat <- t(imputed_abc) %>% as.matrix
+myheat <- myheat[heatmap_features, cell_sample]
+
+patient_colors <- pals::glasbey()
+names(patient_colors) <- unique(diagnosis_lsc_object$patient_manuscript_id)
+patient_colors <- patient_colors[!is.na(names(patient_colors))]
+
+col_split <- gsub(".*-|_Diagnosis", "", colnames(myheat))
+col_split <- gsub("Patient_", "P", col_split)
+col_split <- unlist(lapply(col_split, function(arg) patient_id_map$patient_manuscript_id[patient_id_map$patient == arg]))
+col_split <- factor(col_split, levels = sort(unique(col_split)))
+
+ha <- HeatmapAnnotation("Patient" = col_split,
+                        col = list(`Patient` = patient_colors),
+                        show_annotation_name = TRUE)
+
+col_fun <- colorRamp2(c(0, 5000), c("white", "red"))
+
+myheat_top <- myheat[1:20, ]
+row_split <- rownames(myheat_top)
+num <- 1
+for (i in 1:length(row_split)) {
+  if (!row_split[i] %in% c("CD33", "CLL1", "CD305", "CD49D", "CD205", "CD244")) {
+    row_split[i] <- num
+  } else {
+    num <- num + 1
+    row_split[i] <- num
+    num <- num + 1
+  }
+}
+
+
+
+ComplexHeatmap::Heatmap(
+  myheat_top,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  row_names_side = "right",
+  top_annotation = ha,
+  column_split = col_split,
+  column_gap = unit(0.8, "mm"),
+  row_gap = unit(1, "mm"),
+  col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 15),
+  #row_split = row_split,
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  use_raster = FALSE
+)
+
+myheat_bot <- myheat[21:nrow(myheat), ]
+ComplexHeatmap::Heatmap(
+  myheat_bot,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  top_annotation = ha,
+  column_split = col_split,
+  column_gap = unit(1, "mm"),
+  col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 10),
+  border = TRUE
+)
+
+
+
+
+```
+
+### Relapse
+```{r heatmap_relapse}
+
+relapse_lsc_object <- dplyr::filter(lsc_object, time == "Relapse")
+
+heatmap_features <- imputed_abc %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::filter(sample_id %in% colnames(relapse_lsc_object), grepl("Relapse", sample_id)) %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", sample_id)) %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::summarize_all(median) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-sample_id)
+
+heatmap_features <- sort(colMedians(as.matrix(heatmap_features)), decreasing = TRUE)
+heatmap_features <- names(heatmap_features)
+heatmap_features <- heatmap_features[!grepl("isotype", heatmap_features, ignore.case = TRUE)]
+
+set.seed(465)
+cell_sample <- lapply(unique(relapse_lsc_object$patient), function(arg) {
+  tmp <- dplyr::filter(relapse_lsc_object, patient %in% arg) %>%
+    dplyr::pull(barcode)
+  tmp <- sample(tmp, min(length(tmp), 100))
+  return(tmp)
+}) %>% unlist()
+stopifnot(all(unique(gsub(".*-", "", cell_sample)) %in% unique(relapse_lsc_object$sample_id)))
+
+markers_remove <- c("ISOTYPE-IGG1K", "ISOTYPE-RAT", "ISOTYPE-ARMENIAN-HAMSTER", "CD34", "CD4", "CD4B", "CD3", "CD8", "CD8A", "CD19", "CD14", "CD15", "CD16", "CD11C", "CD5", "CD38", "CD45", "CD9")
+markers_remove <- c("ISOTYPE-IGG1K", "ISOTYPE-RAT", "ISOTYPE-ARMENIAN-HAMSTER", "CD4", "CD4B", "CD3", "CD8", "CD8A", "CD19", "CD5", "CD71", "CD235A", "CD22")
+
+heatmap_features <- heatmap_features[!heatmap_features %in% markers_remove]
+
+myheat <- t(imputed_abc) %>% as.matrix
+myheat <- myheat[heatmap_features, cell_sample]
+
+patient_colors <- pals::glasbey()
+names(patient_colors) <- unique(relapse_lsc_object$patient_manuscript_id)
+patient_colors <- patient_colors[!is.na(names(patient_colors))]
+
+col_split <- gsub(".*-|_Relapse", "", colnames(myheat))
+col_split <- gsub("Patient_", "P", col_split)
+col_split <- unlist(lapply(col_split, function(arg) patient_id_map$patient_manuscript_id[patient_id_map$patient == arg]))
+col_split <- factor(col_split, levels = sort(unique(col_split)))
+
+ha <- HeatmapAnnotation("Patient" = col_split,
+                        col = list(`Patient` = patient_colors),
+                        show_annotation_name = TRUE)
+
+col_fun <- colorRamp2(c(0, 5000), c("white", "red"))
+
+myheat_top <- myheat[1:20, ]
+row_split <- rownames(myheat_top)
+num <- 1
+for (i in 1:length(row_split)) {
+  if (!row_split[i] %in% c("CD33", "CLL1", "CD305", "CD49D", "CD205", "CD244")) {
+    row_split[i] <- num
+  } else {
+    num <- num + 1
+    row_split[i] <- num
+    num <- num + 1
+  }
+}
+
+
+
+ComplexHeatmap::Heatmap(
+  myheat_top,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  row_names_side = "right",
+  top_annotation = ha,
+  column_split = col_split,
+  column_gap = unit(0.8, "mm"),
+  row_gap = unit(1, "mm"),
+  col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 15),
+  #row_split = row_split,
+  row_title_gp = grid::gpar(fontsize = 0),
+  border = TRUE,
+  use_raster = FALSE
+)
+
+myheat_bot <- myheat[21:nrow(myheat), ]
+ComplexHeatmap::Heatmap(
+  myheat_bot,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  top_annotation = ha,
+  column_split = col_split,
+  column_gap = unit(1, "mm"),
+  col = col_fun,
+  column_title_rot = 45,
+  column_title_gp = grid::gpar(fontsize = 13),
+  row_names_gp = grid::gpar(fontsize = 10),
+  border = TRUE
+)
+
+```
+
+
+# Calculate % blasts expressing each antigen at varying thresholds
+```{r antigen_density_single_ranking_in_blasts}
+
+thresholds <- seq(100, 10000, 100)
+
+# restrict ranking to HSC-like blasts that are enriched for LSCs
+lsc_barcodes <- dplyr::filter(blast_object, predicted_id %in% "HSC") %>% pull(barcode)
+imputed_abc_lsc <- imputed_abc[rownames(imputed_abc) %in% lsc_barcodes, ]
+
+imputed_abc_split <- imputed_abc_lsc %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::mutate(sample_id = gsub(".*-", "", sample_id)) %>%
+  dplyr::group_split(sample_id)
+
+patient_single_rank <- lapply(imputed_abc_split, function(pat_rank) {
+  
+  sample_id <- unique(pat_rank$sample_id)
+  pat_rank <- dplyr::select(pat_rank, -sample_id)
+  single_ag_rank <- lapply(pat_rank, function(marker) {
+    
+    thr_res <- NULL
+    for (thr in thresholds) {
+      thr_res[as.character(thr)] <- sum(marker > thr) / length(marker) * 100
+    }
+    return(thr_res)
+    
+  })
+  
+  mynam <- names(single_ag_rank)
+  single_ag_rank <- do.call("rbind", single_ag_rank)
+  single_ag_rank <- data.frame(sample_id = sample_id, antigen = mynam, single_ag_rank)
+  
+  return(single_ag_rank)
+
+})
+
+single_ag_aggr <- do.call("rbind", patient_single_rank)
+
+outpath <- glue::glue("s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_single_antigen_ranking_from_ADT_for_each_sample_LSC_{Sys.Date()}.csv")
+aws.s3::s3write_using(single_ag_aggr, FUN = readr::write_csv, object = outpath)
+
+```
+
+# Generate UMAP plots showing imputed ABCs for 4 antigens
+```{r umap_imputed_abc}
+
+thr <- 1000
+cd33_cells <- rownames(imputed_abc)[imputed_abc[, "CD33"] > thr]
+cll1_cells <- rownames(imputed_abc)[imputed_abc[, "CLL-1"] > thr]
+cd123_cells <- rownames(imputed_abc)[imputed_abc[, "CD123"] > thr]
+emr2_cells <- rownames(imputed_abc)[imputed_abc[, "EMR2"] > thr]
+multiple_cells <- c(cd33_cells, cll1_cells, cd123_cells, emr2_cells)
+multiple_cells <- multiple_cells[duplicated(multiple_cells)]
+multiple_cells <- unique(multiple_cells)
+cells_list <- list("1_ADGRE2 only" = emr2_cells,
+                   "2_CD123 only" = cd123_cells,
+                   "3_CLL-1 only" = cll1_cells,
+                   "4_CD33 only" = cd33_cells)
+
+cells_list <- lapply(cells_list, function(arg) arg[!arg %in% multiple_cells])
+cells_list <- c(cells_list, list("Multiple antigens" = multiple_cells))
+
+tmp_object <- dplyr::filter(blast_object, patient %in% "Patient_31")
+DefaultAssay(tmp_object) <- "RNA"
+
+tmp_object <- tmp_object %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunUMAP(dims = 1:50)
+
+DimPlot(tmp_object, 
+        group.by = "time",
+        label = TRUE,
+        cols.highlight = c("red","cornflowerblue", "forestgreen", "orange", "purple"),
+        reduction = "umap",
+        shuffle = TRUE) + NoAxes()
+
+DimPlot(tmp_object, 
+        #split.by = "time",
+        #group.by = "sample_id",
+        #label = TRUE,
+        cells.highlight = cells_list, 
+        cols.highlight = c("red","cornflowerblue", "forestgreen", "orange", "purple"),
+        reduction = "umap",
+        shuffle = TRUE) + NoAxes()
+
+
+```
+
+
+
+
+
+
+
+
