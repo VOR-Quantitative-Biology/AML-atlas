@@ -1,0 +1,1878 @@
+---
+title: "Tertiary Analysis of AML Hematology Atlas"
+author: "Matt Ung and Alyssa Pyclik"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    code_folding: hide
+    theme: yeti
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include = FALSE}
+
+library(flowCore)
+library(SeuratObject)
+library(BPCells)
+library(Seurat)
+library(SeuratDisk)
+library(dplyr)
+library(aws.s3)
+library(tibble)
+library(tidyr)
+library(dotenv)
+library(ggplot2)
+library(ggpubr)
+library(glue)
+library(DoubletFinder)
+library(tidyseurat)
+library(pzfx)
+library(preprocessCore)
+library(pals)
+library(EnhancedVolcano)
+library(SeuratWrappers)
+library(alphahull)
+library(igraph)
+library(reticulate)
+library(viridis)
+library(msigdbr)
+library(GSVA)
+library(escape)
+library(dittoSeq)
+library(fgsea)
+library(GSEABase)
+library(ggbeeswarm)
+library(circlize)
+library(pheatmap)
+library(biomaRt)
+library(SingleCellExperiment)
+library(Matrix)
+library(stringr)
+library(ComplexHeatmap)
+library(future)
+library(circlize)
+library(msigdbr)
+library(survival)
+library(survminer)
+library(broom)
+library(scales)
+library(lubridate)
+library(future)
+library(ggsci)
+library(bazar)
+library(flowCore)
+library(mclust)
+library(doParallel)
+library(foreach)
+library(scales)
+library(tictoc)
+library(randomForest)
+library(e1071)
+library(survminer)
+library(robCompositions)
+library(dsb)
+library(table1)
+library(gtsummary)
+
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 1e9)
+
+load_dot_env(file = "/home/rstudio/data/bitbucket/.env")
+
+knitr::opts_knit$set(root.dir = "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas")
+
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = Sys.getenv("key"),
+  "AWS_SECRET_ACCESS_KEY" = Sys.getenv("secret"),
+  "AWS_DEFAULT_REGION" = "us-east-1"
+)
+
+cl <- makeCluster(12)
+registerDoParallel(cl)
+
+
+# unregister <- function() {
+#   env <- foreach:::.foreachGlobals
+#   rm(list=ls(name=env), pos=env)
+# }
+
+
+```
+
+```{r functions}
+
+dsb_ebayes <- function (cell_protein_matrix, empty_drop_matrix, denoise.counts = TRUE, 
+          use.isotype.control = TRUE, isotype.control.name.vec = NULL, 
+          define.pseudocount = FALSE, pseudocount.use, quantile.clipping = FALSE, 
+          quantile.clip = c(0.001, 0.9995), scale.factor = c("standardize", 
+                                                             "mean.subtract")[1], return.stats = FALSE) 
+{
+  if (is.null(empty_drop_matrix)) {
+    stop(paste0("to use DSBNormalizeProtein specify `empty_drop_matrix`", 
+                "to normalize ADT data without using empty droplets use", 
+                "the function `ModelNegativeADTnorm`"))
+  }
+  a = isotype.control.name.vec
+  b = rownames(empty_drop_matrix)
+  cm = rownames(cell_protein_matrix)
+  if (!isTRUE(all.equal(cm, b))) {
+    diff = c(setdiff(cm, b), setdiff(b, cm))
+    if (!isTRUE(all.equal(nrow(cell_protein_matrix), nrow(empty_drop_matrix)))) {
+      stop(paste0("the number of proteins in `cell_protein_matrix` and `empty_drop_matrix` do not match check: ", 
+                  diff))
+    }
+    if (length(diff) > 0) {
+      stop(paste0("rows of cell and background matrices have mis-matching names: \n", 
+                  diff))
+    }
+    if (length(diff < 0)) {
+      rmatch = match(x = rownames(cell_protein_matrix), 
+                     table = rownames(empty_drop_matrix))
+      empty_drop_matrix = empty_drop_matrix[rmatch, ]
+      warning(paste0("rows (proteins) of cell_protein_matrix and `empty_drop_matrix`", 
+                     "were not in the same order. dsb reordered `empty_drop_matrix` rows", 
+                     "to match `cell_protein_matrix` rows"))
+    }
+  }
+  iso_detect = cm[grepl(pattern = "sotype|Iso|iso|control|CTRL|ctrl|Ctrl|ontrol", 
+                        x = cm)]
+  if (!is.null(a) & !isTRUE(all(a %in% b)) & !isTRUE(all(a %in% 
+                                                         cm))) {
+    stop(paste0("some elements of isotype.control.name.vec are not in input data rownames: \n", 
+                "cell_protein_matrix - ", setdiff(a, cm), " \nempty_drop_matrix - ", 
+                setdiff(a, b)))
+  }
+  if (isFALSE(denoise.counts)) {
+    print(paste0("Not running dsb step II (removal of cell to cell technical noise)", 
+                 " Setting use.isotype.control and isotype.control.name.vec to FALSE and NULL"))
+    use.isotype.control = FALSE
+    isotype.control.name.vec = NULL
+    if (length(iso_detect) > 0) {
+      print("potential isotype controls detected: ")
+      print(iso_detect)
+    }
+  }
+  if (isTRUE(use.isotype.control) & is.null(isotype.control.name.vec)) {
+    if (length(iso_detect) > 0) {
+      print("potential isotype controls detected: ")
+      print(iso_detect)
+    }
+    stop("if use.isotype.control = TRUE, set isotype.control.name.vec to rownames of isotype controls")
+  }
+  if (isTRUE(denoise.counts) & isFALSE(use.isotype.control)) {
+    warning(paste0("`use.isotype.control` = FALSE is not recommended if setting `denoise.counts` = TRUE", 
+                   " \nwhen isotype controls are available.\n If data include isotype controls", 
+                   " set `denoise.counts` = TRUE `use.isotype.control` = TRUE", 
+                   " \and set `isotype.control.name.vec` to a vector of isotype control rownames"))
+    if (length(iso_detect) > 0) {
+      print("potential isotype controls detected: ")
+      print(iso_detect)
+    }
+  }
+  adt = cell_protein_matrix %>% as.matrix()
+  adtu = empty_drop_matrix %>% as.matrix()
+  if (isTRUE(define.pseudocount)) {
+    adtu_log = log(adtu + pseudocount.use)
+    adt_log = log(adt + pseudocount.use)
+  }
+  else {
+    adtu_log = log(adtu + 10)
+    adt_log = log(adt + 10)
+  }
+  print("correcting ambient protein background noise")
+  mu_u = apply(adtu_log, 1, mean)
+  sd_u = apply(adtu_log, 1, sd)
+  
+  
+  # use empirical bayes to shrink background means [ADD-ON]
+  mu_u = coef(ebnm::ebnm(x = mu_u, s = sd_u, mode = "estimate", prior_family = "normal"))
+  
+  
+  if (scale.factor == "standardize") {
+    if (any(sd_u < 0.05)) {
+      print(paste0("some proteins with low background variance detected", 
+                   " check raw and normalized distributions. ", 
+                   " protein stats can be returned with return.stats = TRUE"))
+      print(names(which(sd_u < 0.05)))
+      
+      
+      # add small variance to features with little background variation [ADD-ON]
+      sd_u[sd_u < 0.05] <- min(sd_u[sd_u > 0.05])
+      
+      
+    }
+    norm_adt = apply(adt_log, 2, function(x) (x - mu_u)/sd_u)
+  }
+  if (scale.factor == "mean.subtract") {
+    norm_adt = apply(adt_log, 2, function(x) (x - mu_u))
+  }
+  if (isTRUE(denoise.counts)) {
+    print(paste0("fitting models to each cell for dsb technical component and", 
+                 " removing cell to cell technical noise"))
+    cellwise_background_mean = apply(norm_adt, 2, function(x) {
+      g = mclust::Mclust(x, G = 2, warn = FALSE, verbose = FALSE)
+      return(g$parameters$mean[1])
+    })
+    gc()
+    if (isTRUE(use.isotype.control)) {
+      noise_matrix = rbind(norm_adt[isotype.control.name.vec, 
+      ], cellwise_background_mean)
+      get_noise_vector = function(noise_matrix) {
+        g = stats::prcomp(t(noise_matrix), scale = TRUE)
+        return(g$x[, 1])
+      }
+      noise_vector = get_noise_vector(noise_matrix)
+      norm_adt = limma::removeBatchEffect(norm_adt, covariates = noise_vector)
+    }
+    else {
+      noise_vector = cellwise_background_mean
+      norm_adt = limma::removeBatchEffect(norm_adt, covariates = noise_vector)
+    }
+  }
+  if (isTRUE(quantile.clipping)) {
+    ql = apply(norm_adt, 1, FUN = stats::quantile, quantile.clip[1])
+    qh = apply(norm_adt, 1, FUN = stats::quantile, quantile.clip[2])
+    for (i in 1:nrow(norm_adt)) {
+      norm_adt[i, ] = ifelse(norm_adt[i, ] < ql[i], ql[i], 
+                             norm_adt[i, ])
+      norm_adt[i, ] = ifelse(norm_adt[i, ] > qh[i], qh[i], 
+                             norm_adt[i, ])
+    }
+  }
+  if (isTRUE(return.stats)) {
+    print("returning results in a list; normalized matrix accessed x$dsb_normalized_matrix")
+    protein_stats = list(`raw cell matrix stats` = data.frame(cell_mean = apply(adt_log, 
+                                                                                1, mean), cell_sd = apply(adt_log, 1, sd)), `dsb normalized matrix stats` = data.frame(dsb_mean = apply(norm_adt, 
+                                                                                                                                                                                        1, mean), dsb_sd = apply(adt_log, 1, sd)))
+    if (isTRUE(denoise.counts)) {
+      if (isTRUE(use.isotype.control)) {
+        technical_stats = cbind(t(noise_matrix), dsb_technical_component = noise_vector)
+      }
+      else {
+        technical_stats = data.frame(dsb_technical_component = noise_vector)
+      }
+    }
+    else {
+      technical_stats = NULL
+    }
+    if (is.null(empty_drop_matrix)) {
+      background.stats = NULL
+    }
+    else {
+      background.stats = data.frame(background_mean = mu_u, 
+                                    background_sd = sd_u)
+      protein_stats = c(protein_stats, background.stats)
+    }
+    ret_obj = list(dsb_normalized_matrix = norm_adt, technical_stats = technical_stats, 
+                   protein_stats = protein_stats)
+    return(ret_obj)
+  }
+  else {
+    return(norm_adt)
+  }
+}
+
+```
+
+Before reading a Seurat v5 .Rds *in-memory*, a folder containing the **object .RDS** & **BPCells matrices** must be downloaded *on-disk* and accessible in your working directory.
+
+*In-memory*, Seurat accesses the *on-disk* matricies by the pre-defined "destination directory" path (pointing to the BPCells directories) and stores them in the assay level data.
+
+```{r load_data}
+
+orig_data <- SeuratObject::LoadSeuratRds(file = "seurat_2024-04-03/aml_atlas_layered_seurat.rds") 
+
+dim(orig_data)
+orig_data@assays
+
+```
+
+# QC
+
+In Seurat v5, objects are either "layered", with raw counts for each dataset stored in individual matrices, or "joined", with all datasets collapsed and stored in one matrix. Seurat requires layers to be joined before downstream analysis.
+
+Before joining the layers, we can perform pre-processing steps on the layered dataset to process each sample independently and use the selected features for downstream analysis. Because we can't filter features in a layered object, the selected features have to be filtered before joining.
+
+## Cell counts across samples prior to filtering
+
+```{r}
+ 
+# total cells by sample_id
+all_total <- table(orig_data$sample_id) %>%
+  as.data.frame() %>% 
+  dplyr::rename("Donor" = "Var1", "total_number_of_cells" = "Freq") %>%
+  dplyr::arrange(desc(total_number_of_cells))
+
+DT::datatable(all_total, rownames = FALSE)
+
+hist(all_total$total_number_of_cells, breaks = 20)
+
+```
+
+## Library size & complexity distributions
+**RNA**
+
+```{r, fig.height=5, fig.width=10}
+
+nfeat_bottom_cutoff <- 200
+nfeat_top_cutoff <- 7000
+
+ncount_top_cutoff <- 30000
+ncount_bottom_cutoff <- 1000
+
+FeatureScatter(orig_data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", pt.size = 0.5) + 
+  geom_hline(yintercept = nfeat_bottom_cutoff, lty = 2) +
+  geom_hline(yintercept = nfeat_top_cutoff, lty = 2) +
+  geom_vline(xintercept = ncount_bottom_cutoff, lty = 2) +
+  geom_vline(xintercept = ncount_top_cutoff, lty = 2)
+
+hist(orig_data$nFeature_RNA, main = "Complexity distribution", breaks = 50)
+abline(v = nfeat_bottom_cutoff, lty = 2)
+
+hist(orig_data$nCount_RNA, main = "Library size distribution",  breaks = 50)
+abline(v = ncount_top_cutoff, lty = 2)
+
+```
+
+**ADT**
+
+```{r, fig.height = 10, fig.width = 15}
+
+DefaultAssay(orig_data) <- "ADT"
+Idents(orig_data) <- "sample_id"
+
+# Visualizing library size & complexity
+VlnPlot(orig_data, features = c("nFeature_ADT", "nCount_ADT"), ncol = 1, pt.size = 0)
+RidgePlot(orig_data, features = "nCount_ADT", group.by = "sample_id", log = TRUE) + NoLegend()
+FeatureScatter(orig_data, feature1 = "nCount_ADT", feature2 = "nFeature_ADT") + NoLegend()
+hist(orig_data$nCount_ADT, breaks = 100)
+
+```
+
+## Filtering
+
+**nCount_RNA, nFeature_RNA, and nCount_ADT**
+
+```{r}
+
+# RNA
+DefaultAssay(orig_data) <- "RNA"
+# orig_data <- dplyr::filter(orig_data, 
+#                            nCount_RNA < ncount_top_cutoff, 
+#                            nCount_RNA > ncount_bottom_cutoff,
+#                            nFeature_RNA > nfeat_bottom_cutoff,
+#                            nFeature_RNA < nfeat_top_cutoff)
+
+orig_data <- dplyr::filter(orig_data, 
+                           nCount_RNA > ncount_bottom_cutoff,
+                           nFeature_RNA > nfeat_bottom_cutoff)
+
+# ADT
+DefaultAssay(orig_data) <- "ADT"
+#orig_data <- dplyr::filter(orig_data, nCount_ADT < 100000)
+
+```
+
+**Summary of mitochondrial composition**
+
+Calculating percentage of cells that pass \<10% mitochondrial composition filter for each sample
+
+```{r mito_analysis}
+
+mito_filt_thr <- 15
+
+mito_summary <- orig_data@meta.data %>%
+  dplyr::group_by(sample_id) %>%
+  dplyr::mutate(perc_cells_pass_mito_filter = signif(sum(percent.mt < mito_filt_thr) / n() * 100, 2)) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(sample_id, perc_cells_pass_mito_filter) %>%
+  dplyr::distinct()
+
+DT::datatable(mito_summary, rownames = FALSE)
+
+orig_data <- dplyr::filter(orig_data, percent.mt <= mito_filt_thr)
+
+```
+
+
+## Integrate data
+
+Seurat's CLR normalization will not work on IterableMatrix object, it's converted to sparse matrix assay (v4 class assay) and processed as before.
+
+### Healthy
+```{r integrate_data_healthy, eval = TRUE}
+
+healthy_data <- dplyr::filter(orig_data, time %in% "Healthy")
+
+healthy_data <- dplyr::mutate(healthy_data, 
+                              experiment_batch = gsub("vorbio-analysis/single_cell/internal/", "", key),
+                              experiment_batch = gsub("\\/.*", "", experiment_batch))
+
+tmp <- JoinLayers(healthy_data, assay = "RNA")
+feat_sums <- rowSums(tmp@assays$RNA@layers$counts)
+healthy_data <- subset(healthy_data, features = c(rownames(healthy_data@assays$ADT), rownames(tmp@assays$RNA)[feat_sums > 0]))
+rm(tmp)
+
+# Normalize, scale, and find variable features 
+healthy_data <- NormalizeData(healthy_data, normalization.method = "LogNormalize", assay = "RNA")
+healthy_data <- FindVariableFeatures(healthy_data, assay = "RNA", nfeatures = 2500)
+healthy_data <- ScaleData(healthy_data, assay = "RNA") 
+healthy_data <- RunPCA(healthy_data, npcs = 50, assay = "RNA", seed.use = 905217) 
+healthy_data2 <- healthy_data
+
+ElbowPlot(healthy_data, ndims = 50)
+
+set.seed(87564)
+healthy_data <- IntegrateLayers(
+  object = healthy_data, 
+  assay = "RNA",
+  method = FastMNNIntegration,
+  layers = "data",
+  auto.merge = TRUE,
+  verbose = TRUE,
+  features = VariableFeatures(healthy_data@assays$RNA)
+)
+
+healthy_data2 <- IntegrateLayers(
+  object = healthy_data2,
+  assay = "RNA",
+  group.by = "sample_id",
+  method = HarmonyIntegration,
+  orig.reduction = "pca",
+  layers = "data",
+  verbose = TRUE
+)
+
+healthy_data@reductions$harmony <- healthy_data2@reductions$harmony
+rm(healthy_data2)
+
+# healthy_data <- JoinLayers(healthy_data, assay = "RNA")
+# healthy_data_split <- SplitObject(healthy_data, split.by = "sample_id")
+# anchors <- FindIntegrationAnchors(healthy_data_split, assay = rep("RNA", length(healthy_data_split)), reduction = "cca", anchor.features = 500) 
+# healthy_data <- IntegrateData(anchorset = anchors)
+
+healthy_data <- FindNeighbors(healthy_data, 
+                              reduction = "integrated.mnn", 
+                              k.param = 15,
+                              graph.name = c("nn_mnn", "snn_mnn"), 
+                              dims = 1:50)
+
+healthy_data <- FindNeighbors(healthy_data, 
+                              reduction = "harmony", 
+                              k.param = 15,
+                              graph.name = c("nn_harmony", "snn_harmony"), 
+                              dims = 1:50)
+
+healthy_data <- FindClusters(healthy_data, 
+                             graph.name = "snn_mnn", 
+                             cluster.name = "seurat_clusters_mnn", 
+                             resolution = 1.5, 
+                             method = "igraph", 
+                             random.seed = 14692)
+
+healthy_data <- FindClusters(healthy_data, 
+                             graph.name = "snn_harmony", 
+                             cluster.name = "seurat_clusters_harmony", 
+                             resolution = 1.5, 
+                             method = "igraph", 
+                             random.seed = 1291)
+
+healthy_data <- RunUMAP(healthy_data, 
+                        reduction = "integrated.mnn", 
+                        dims = 1:50, 
+                        reduction.key = "UMAP_mnn_", 
+                        reduction.name = "umap_mnn", 
+                        repulsion.strength = 3, 
+                        local.connectivity = 5,
+                        n.neighbors = 30,
+                        spread = 4,
+                        return.model = TRUE,
+                        seed.use = 259814)
+
+healthy_data <- RunUMAP(healthy_data, 
+                        reduction = "harmony", 
+                        dims = 1:50, 
+                        reduction.key = "UMAP_harmony_", 
+                        reduction.name = "umap_harmony", 
+                        repulsion.strength = 1, 
+                        local.connectivity = 2,
+                        n.neighbors = 30,
+                        spread = 5,
+                        seed.use = 286)
+
+# Join ADT layers
+healthy_data <- JoinLayers(healthy_data, assay = "ADT")
+
+DefaultAssay(healthy_data) <- "ADT"
+
+# convert ADT counts to sparse matrix 
+healthy_data[["ADT"]] <- as(object = healthy_data[["ADT"]], Class = "Assay")
+
+# ignore variation from isotype controls
+adt_feats <- rownames(healthy_data@assays$ADT)
+adt_feats <- adt_feats[!grepl("isotype", adt_feats, ignore.case = TRUE)]
+
+healthy_data <- healthy_data %>%
+  NormalizeData(normalization.method = "CLR", assay = "ADT", margin = 2) %>%
+  ScaleData(assay = "ADT", features = adt_feats, vars.to.regress = "sample_id") %>%
+  RunPCA(assay = "ADT", reduction.name = "pca_adt", features = adt_feats, seed.use = 65187) %>%
+  FindNeighbors(reduction = "pca_adt", graph.name = "snn_adt") %>%
+  FindClusters(graph.name = "snn_adt", cluster.name = "seurat_clusters_adt", random.seed = 11293) %>%
+  RunUMAP(reduction = "pca_adt", reduction.name = "umap_adt", seed.use = 99698, dims = 1:10)
+
+# healthy_data[["ADT"]] <- split(healthy_data[["ADT"]], f = healthy_data$sample_id)
+# 
+# healthy_data <- IntegrateLayers(
+#   object = healthy_data, 
+#   assay = "ADT",
+#   features = adt_feats,
+#   method = FastMNNIntegration,
+#   layers = "data",
+#   new.reduction = "integrated.mnn_adt",
+#   reduction.key = "mnn_adt_",
+#   reconstructed.assay = "mnn.reconstructed_adt",
+#   auto.merge = TRUE,
+#   verbose = TRUE
+# )
+
+healthy_data <- FindMultiModalNeighbors(
+  healthy_data, 
+  reduction.list = list("integrated.mnn", "pca_adt"), 
+  dims.list = list(1:50, 1:5), 
+  modality.weight.name = "RNA.weight"
+)
+
+healthy_data <- RunUMAP(healthy_data, 
+                        nn.name = "weighted.nn", 
+                        reduction.name = "umap_wnn", 
+                        reduction.key = "wnnUMAP_",
+                        repulsion.strength = 2, 
+                        local.connectivity = 1,
+                        n.neighbors = 20,
+                        spread = 5,
+                        seed.use = 8357)
+
+
+
+DotPlot(healthy_data, features = c("CD3", "CD19", "CD14", "CD45", "CD34"), group.by = "seurat_clusters_mnn", assay = "ADT")
+
+FeaturePlot(healthy_data, features = c("CD34", "CD33", "CD3", "CD19"), reduction = "umap_mnn")
+
+feature_cluster <- hclust(dist(healthy_data@assays$ADT@scale.data))
+
+DoHeatmap(healthy_data, 
+          features = rownames(healthy_data@assays$ADT@scale.data)[feature_cluster$order], 
+          assay = "ADT", 
+          group.by = "seurat_clusters_mnn", 
+          cells = sample(healthy_data$barcode, 1000, replace = FALSE))
+
+Idents(healthy_data) <- "seurat_clusters_mnn"
+cluster_markers <- FindAllMarkers(healthy_data, 
+                                  assay = "ADT", 
+                                  logfc.threshold = log2(1.1), 
+                                  random.seed = 3611, 
+                                  only.pos = FALSE, 
+                                  test.use = "negbinom", 
+                                  latent.vars = "sample_id") %>%
+  dplyr::arrange(cluster, desc(avg_log2FC)) %>%
+  dplyr::group_split(cluster)
+
+mymarkers <- do.call("rbind", cluster_markers) %>%
+  dplyr::pull(gene) %>%
+  unique()
+mymarkers <- mymarkers[!grepl("ISOTYPE", mymarkers)]
+
+feature_cluster <- hclust(dist(healthy_data@assays$ADT@scale.data[mymarkers, ]))
+cell_sample <- unlist(lapply(unique(healthy_data$cell_state_mnn_rna_l1), function(arg) sample(colnames(healthy_data)[healthy_data$cell_state_mnn_rna_l1 %in% arg], 100)))
+DoHeatmap(healthy_data, 
+          features = rownames(healthy_data@assays$ADT@scale.data[mymarkers, ])[feature_cluster$order], 
+          assay = "ADT", 
+          group.by = "seurat_clusters_mnn", 
+          cells = cell_sample)
+
+
+cluster_markers_rna <- FindAllMarkers(JoinLayers(healthy_data, assay = "RNA"), 
+                                      assay = "RNA", 
+                                      logfc.threshold = log2(1.1), 
+                                      latent.vars = "sample_id",
+                                      random.seed = 4860, 
+                                      only.pos = TRUE) %>%
+  dplyr::arrange(cluster, desc(avg_log2FC)) %>%
+  dplyr::group_split(cluster)
+
+# annotate cells
+# naive_bcell <- c(12, 16, 20, 32)
+# memory_bcell <- c(36)
+# plasma_cell <- c(30)
+# bcell_precursor <- c(15, 27)
+# cd4_naive_tcells <- c(0)
+# cd4_memory_tcells <- c(1, 2)
+# cd8_naive_tcells <- c(3)
+# cd8_memory_tcells <- c(5)
+# monocytes <- c(7, 8)
+# granulocyte <- c(25, 28)
+# cdc <- c(21)
+# pdc <- c(29)
+# nk <- c(6, 13)
+# nkt <- c(4)
+# neutrophil <- c(14)
+# erythroblast <- c(10, 26)
+# erythrocyte <- c(9, 19, 22, 23, 31)
+# hsc <- c(11)
+# gmp <- c(24)
+# mep <- c(18)
+
+
+bcell <- c(12, 15, 19, 24, 30)
+bcell_precursor <- c(16)
+cd4_naive_tcells <- c(0)
+cd4_memory_tcells <- c(1, 2)
+cd8_naive_tcells <- c(4)
+cd8_memory_tcells <- c(5)
+monocytes <- c(7, 8, 21, 28)
+cdc <- c(22)
+pdc <- c(29)
+nk <- c(6, 13)
+nkt <- c(3)
+erythroblast <- c(10, 20, 27)
+erythroid <- c(9, 23, 25)
+megakaryocyte_precursor <- c(18)
+hsc <- c(11)
+gmp <- c(26)
+mep <- c(17)
+unknown <- c(14, 31)
+
+healthy_data <- healthy_data %>%
+  dplyr::mutate(cell_state_mnn_rna_l1 = case_when(seurat_clusters_mnn %in% hsc ~ "HSC",
+                                                      seurat_clusters_mnn %in% mep ~ "MEP",
+                                                      seurat_clusters_mnn %in% gmp ~ "GMP",
+                                                      seurat_clusters_mnn %in% bcell ~ "B cell",
+                                                      seurat_clusters_mnn %in% bcell_precursor ~ "Pre/pro B cell",
+                                                      seurat_clusters_mnn %in% cd4_naive_tcells ~ "CD4+ naive T",
+                                                      seurat_clusters_mnn %in% cd4_memory_tcells ~ "CD4+ memory T",
+                                                      seurat_clusters_mnn %in% cd8_naive_tcells ~ "CD8+ naive T",
+                                                      seurat_clusters_mnn %in% cd8_memory_tcells ~ "CD8+ memory T",
+                                                      seurat_clusters_mnn %in% erythroblast ~ "Erythroblast",
+                                                      seurat_clusters_mnn %in% erythroid ~ "Erythroid",
+                                                      seurat_clusters_mnn %in% megakaryocyte_precursor ~ "MkP",
+                                                      seurat_clusters_mnn %in% monocytes ~ "Monocyte",
+                                                      seurat_clusters_mnn %in% cdc ~ "cDC",
+                                                      seurat_clusters_mnn %in% pdc ~ "pDC",
+                                                      seurat_clusters_mnn %in% nk ~ "NK",
+                                                      seurat_clusters_mnn %in% nkt ~ "NKT",
+                                                      seurat_clusters_mnn %in% unknown ~ "Unknown")) %>%
+  dplyr::mutate(cell_state_mnn_rna_l1 = factor(cell_state_mnn_rna_l1, 
+                                                   levels = c("HSC",
+                                                              "MEP",
+                                                              "GMP",
+                                                              "Monocyte",
+                                                              "cDC",
+                                                              "pDC",
+                                                              "NK",
+                                                              "B cell",
+                                                              "Pre/pro B cell",
+                                                              "CD4+ naive T",
+                                                              "CD4+ memory T",
+                                                              "CD8+ naive T",
+                                                              "CD8+ memory T",
+                                                              "NKT",
+                                                              "Erythroblast",
+                                                              "Erythroid",
+                                                              "MkP",
+                                                              "Unknown")))
+
+
+# identify subclusters
+healthy_data_split <- SplitObject(healthy_data, split.by = "cell_state_mnn_rna_l1")
+
+cluster_list <- NULL
+for (i in 1:length(healthy_data_split)) {
+  
+  cat(i, "\n")
+  arg <- healthy_data_split[[i]]
+  arg <- NormalizeData(arg)
+  arg <- FindVariableFeatures(arg)
+  arg <- ScaleData(arg, vars.to.regress = "sample_id")
+  arg <- RunPCA(arg)
+  
+  # arg <- IntegrateLayers(
+  #   object = arg, 
+  #   assay = "RNA",
+  #   method = FastMNNIntegration,
+  #   orig.reduction = "pca", 
+  #   d = 30,
+  #   auto.merge = TRUE,
+  #   verbose = TRUE
+  # )
+  
+  arg <- FindNeighbors(arg, 
+                       reduction = "pca", 
+                       k.param = 15,
+                       n.trees = 100,
+                       dims = 1:30)
+  
+  arg <- FindClusters(arg, 
+                      cluster.name = "seurat_subclusters", 
+                      resolution = 0.5, 
+                      method = "igraph", 
+                      random.seed = 1291)
+
+  arg <- dplyr::select(arg, barcode, seurat_subclusters)
+    
+  cluster_list[[names(healthy_data_split)[i]]] <- arg
+  
+}
+
+subclusters <- do.call("rbind", cluster_list)
+stopifnot(healthy_data$barcode %in% subclusters$barcode)
+healthy_data <- healthy_data %>% 
+  dplyr::left_join(subclusters, by = "barcode") %>%
+  dplyr::mutate(seurat_subclusters = paste(seurat_clusters_mnn, seurat_subclusters, sep = "-"))
+
+mycols <- c("firebrick1", "lightcyan3", "seagreen3", "cyan", "purple", "hotpink", "gold1", "mediumturquoise", "yellow2", "sienna3", "springgreen", "olivedrab", "orange1",  "cornflowerblue", "rosybrown1", "maroon2", "slateblue2", "tan2", "peachpuff1", "orchid1", "yellowgreen", "burlywood2")
+
+DimPlot(dplyr::filter(healthy_data, cell_state_mnn_rna_l1 != "Unknown"), 
+        group.by = "cell_state_mnn_rna_l1", 
+        reduction = "umap_mnn", 
+        cols = as.character(mycols), 
+        label = TRUE, 
+        repel = TRUE,
+        label.size = 5,
+        alpha = 0.7) +
+  NoAxes() +
+  NoLegend() 
+
+
+DimPlot(healthy_data, group.by = "seurat_clusters_mnn", label = TRUE)
+
+healthy_data_subset <- dplyr::filter(healthy_data, cell_state_mnn_rna_l1 != "Unknown")
+healthy_data_subset <- lapply(unique(healthy_data_subset$cell_state_mnn_rna_l1), function(arg) {
+  sample(colnames(dplyr::filter(healthy_data_subset, cell_state_mnn_rna_l1 == arg)), 100)
+}) %>% unlist()
+healthy_data_subset <- subset(healthy_data, cells = healthy_data_subset) %>%
+  dplyr::mutate(cell_state_mnn_rna_l1 = factor(cell_state_mnn_rna_l1))
+
+rownames(healthy_data_subset@assays$ADT@scale.data) <- case_when(rownames(healthy_data_subset@assays$ADT@scale.data) == "CLL1" ~ "CLL-1",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "EMR2" ~ "ADGRE2",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD205" ~ "DEC-205",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD49D" ~ "ITGA4",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD305" ~ "LAIR1",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD85K" ~ "LILRB4",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD88" ~ "C5AR1",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD120B" ~ "TNFR2",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD135" ~ "FLT3",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD152" ~ "CTLA-4",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD200" ~ "OX2",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD266" ~ "DNAM-1",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD235A" ~ "GlyA",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD273" ~ "PD-L2",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD274" ~ "PD-L1",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD279" ~ "PD-1",
+                                                          rownames(healthy_data_subset@assays$ADT@scale.data) == "CD366" ~ "Tim-3",
+                                                          TRUE ~ as.character(rownames(healthy_data_subset@assays$ADT@scale.data)))
+
+adt_feats <- rownames(healthy_data_subset@assays$ADT@scale.data)
+myclust <- hclust(dist(healthy_data_subset@assays$ADT@scale.data), method = "ward.D2")
+adt_feats <- adt_feats[myclust$order]
+
+DoHeatmap(healthy_data_subset, 
+          group.by = "cell_state_mnn_rna_l1", 
+          assay = "ADT", 
+          features = adt_feats, 
+          group.colors = mycols,
+          size = 4,
+          raster = FALSE)
+
+
+rna_de_feats <- FindAllMarkers(JoinLayers(healthy_data, assay = "RNA"),
+                               group.by = "cell_state_mnn_rna_l1",
+                               assay = "RNA",
+                               min.pct = 0.1,
+                               logfc.threshold = 1)
+
+rna_feats <- rna_de_feats %>%
+  dplyr::filter(p_val_adj < 0.00001 | is.na(p_val_adj)) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::arrange(p_val) %>%
+  dplyr::slice(1:5) %>%
+  dplyr::ungroup()
+
+rna_feats <- dplyr::bind_rows(rna_feats,
+                              data.frame(cluster = "HSC", gene = c("AVP", "MECOM", "HLF")),
+                              data.frame(cluster = "NKT", gene = c("ADGRG1", "TRGV5", "TRDC", "TRGC1", "TRAV10", "TRAV25")),
+                              data.frame(cluster = "Erythroid", gene = "GYPA"),
+                              data.frame(cluster = "pDC", gene = "IL3RA"),
+                              data.frame(cluster = "CD4+ naive T", gene = "CD4"),
+                              data.frame(cluster = "B cell", gene = "CD19"),
+                              data.frame(cluster = "MkP", gene = c("PF4", "GATA1"))) %>%
+  dplyr::mutate(cluster = factor(cluster, levels = levels(healthy_data$cell_state_mnn_rna_l1))) %>%
+  dplyr::arrange(cluster)
+
+rna_feats <- rna_feats %>%
+  dplyr::pull(gene) %>%
+  unique()
+
+healthy_data_subset <- ScaleData(healthy_data_subset, features = rna_feats, assay = "RNA")
+
+# myclust <- hclust(dist(LayerData(healthy_data_subset, features = rna_feats, layer = "scale.data", assay = "RNA")))
+# rna_feats <- rna_feats[myclust$order]
+
+DoHeatmap(healthy_data_subset, 
+          group.by = "cell_state_mnn_rna_l1", 
+          assay = "RNA", 
+          features = rna_feats, 
+          group.colors = mycols,
+          size = 4,
+          raster = FALSE)
+
+
+
+
+
+
+
+
+
+FeaturePlot(healthy_data, features = c("rna_AVP"), reduction = "umap_mnn")
+VlnPlot(healthy_data, features = c("TYMS"),  group.by = "seurat_clusters_harmony")
+DotPlot(healthy_data, features = c("TYMS", "C1QTNF4", "PIK3R1", "GYPC", "IGLL1", "STMN1", "TUBB", "HNRNPA1", "SLC40A1", "RNF130", "HIST1H4C"),  group.by = "seurat_clusters_harmony", assay = "RNA") + RotatedAxis()
+
+healthy_adj_matrix <- healthy_data@graphs$nn_harmony
+
+```
+
+
+
+### AML
+#### RNA
+##### Harmony
+```{r integrate_data_aml}
+
+paired_samples <- c("4", "26", "27", "28", "29", "30", "31", "40", "41", "42", "43", "44", "47", "48", "49", "50", "51", "52", "54", "56", "58", "60", "61", "64", "65", "66", "67", "70")
+paired_samples <- paste0("Patient_", paired_samples)
+
+aml_data <- dplyr::filter(orig_data, patient %in% paired_samples)
+rm(orig_data)
+
+# Normalize, scale, and find variable features 
+aml_data <- FindVariableFeatures(aml_data, assay = "RNA", nfeatures = 2000)
+aml_data <- NormalizeData(aml_data, normalization.method = "LogNormalize", assay = "RNA", margin = 2)
+aml_data <- ScaleData(aml_data, assay = "RNA") 
+aml_data <- RunPCA(aml_data, assay = "RNA", seed.use = 466) 
+aml_data <- RunUMAP(aml_data, dims = 1:25, assay = "RNA", seed.use = 59111)
+
+output_path <- "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat_2024-04-03/aml_data_paired_samples_layered.rds"
+
+if (!file.exists(output_path)) {
+  saveRDS(aml_data, output_path)
+}
+  
+set.seed(912)
+aml_data <- IntegrateLayers(
+  object = aml_data, 
+  assay = "RNA",
+  group.by = "sample_id",
+  method = HarmonyIntegration, #other methods don't work with Seurat v5 beta
+  orig.reduction = "pca", 
+  verbose = TRUE
+)
+
+aml_data <- FindNeighbors(aml_data, 
+                          reduction = "harmony", 
+                          graph.name = c("nn_harmony", "snn_harmony"), 
+                          dims = 1:35)
+
+aml_data <- FindClusters(aml_data, 
+                         graph.name = "snn_harmony", 
+                         cluster.name = "seurat_clusters_harmony", 
+                         resolution = 0.9, 
+                         method = "igraph", 
+                         random.seed = 871)
+
+aml_data <- RunUMAP(aml_data, 
+                    reduction = "harmony", 
+                    dims = 1:35, 
+                    reduction.key = "UMAP_harmony_", 
+                    reduction.name = "umap_harmony", 
+                    repulsion.strength = 2, 
+                    n.neighbors = 15,
+                    seed.use = 141)
+
+aml_data <- RunUMAP(aml_data, 
+                    reduction = "harmony", 
+                    dims = 1:35, 
+                    reduction.key = "UMAP_harmony_3d_", 
+                    reduction.name = "umap_harmony_3d", 
+                    repulsion.strength = 2, 
+                    n.neighbors = 15,
+                    n.components = 3,
+                    seed.use = 141)
+
+```
+
+##### FastMNN
+```{r integrate_data_aml}
+
+set.seed(912)
+aml_data_tmp <- IntegrateLayers(
+  object = aml_data_tmp, 
+  assay = "RNA",
+  #group.by = "sample_id",
+  method = FastMNNIntegration, #other methods don't work with Seurat v5 beta
+  orig.reduction = "pca", 
+  verbose = TRUE
+)
+
+aml_data_tmp <- FindNeighbors(aml_data_tmp, 
+                              reduction = "integrated.mnn", 
+                              graph.name = c("nn_mnn", "snn_mnn"), 
+                              dims = 1:35)
+
+aml_data_tmp <- FindClusters(aml_data_tmp, 
+                             graph.name = "snn_mnn", 
+                             cluster.name = "seurat_clusters_mnn", 
+                             resolution = 0.9, 
+                             method = "igraph", 
+                             random.seed = 871)
+
+aml_data_tmp <- RunUMAP(aml_data_tmp, 
+                        reduction = "integrated.mnn", 
+                        dims = 1:35, 
+                        reduction.key = "UMAP_mnn_", 
+                        reduction.name = "umap_mnn", 
+                        repulsion.strength = 1, 
+                        n.neighbors = 15,
+                        seed.use = 141)
+
+aml_data@reductions$mnn <- aml_data_tmp@reductions$integrated.mnn
+aml_data@reductions$umap_mnn <- aml_data_tmp@reductions$umap_mnn
+aml_data@assays$RNA_mnn_reconstructed <- aml_data_tmp@assays$mnn.reconstructed
+rm(aml_data_tmp)
+```
+
+#### ADT
+```{r analyze_adt}
+
+# temporary fix; perform formal imputation of missing ADT features later **** these samples have different number of antigens in panel
+pat47and48 <- dplyr::filter(aml_data, patient %in% c("Patient_47", "Patient_48"))
+aml_data <- dplyr::filter(aml_data, !patient %in% c("Patient_47", "Patient_48"))
+# remove cells with no ADT signal 
+aml_data <- dplyr::filter(aml_data, nCount_ADT > 0)
+# Join ADT layers
+aml_data <- JoinLayers(aml_data, assay = "ADT")
+
+DefaultAssay(aml_data) <- "ADT"
+# convert ADT counts to sparse matrix
+aml_data[["ADT"]] <- as(object = aml_data[["ADT"]], Class = "Assay")
+
+# ignore variation from isotype controls
+adt_feats <- rownames(aml_data@assays$ADT)
+adt_feats <- adt_feats[!grepl("isotype", adt_feats, ignore.case = TRUE)]
+
+aml_data <- NormalizeData(aml_data, normalization.method = "CLR", assay = "ADT", margin = 2)
+aml_data <- ScaleData(aml_data, assay = "ADT", features = adt_feats, vars.to.regress = "sample_id")
+aml_data <- RunPCA(aml_data, assay = "ADT", reduction.name = "pca_adt", features = adt_feats, seed.use = 6587)
+aml_data <- FindNeighbors(aml_data, reduction = "pca_adt", graph.name = c("nn_adt", "snn_adt"))
+aml_data <- FindClusters(aml_data, graph.name = "snn_adt", cluster.name = "seurat_clusters_adt", random.seed = 1193)
+aml_data <- RunUMAP(aml_data, reduction = "pca_adt", reduction.name = "umap_adt", seed.use = 698, dims = 1:10)
+
+# background correction using limma to regress out signal from isotype controls
+isotype_controls <- rownames(aml_data@assays$ADT)
+isotype_controls <- isotype_controls[grepl("isotype", isotype_controls, ignore.case = TRUE)]
+model_data <- aml_data@assays$ADT@data
+rownames(model_data) <- rownames(aml_data@assays$ADT)
+colnames(model_data) <- colnames(aml_data@assays$ADT)
+
+mod_res <- limma::removeBatchEffect(x = model_data[!rownames(model_data) %in% isotype_controls, ], 
+                                    covariates = t(model_data[rownames(model_data) %in% isotype_controls, ]))
+aml_data[["ADT_limma"]] <- Seurat::CreateAssayObject(data = mod_res)
+
+# background correction using DSB
+sample_paths <- unique(aml_data$key)
+raw_sample_paths <- gsub("filtered", "raw", sample_paths)
+raw_sample_paths <- paste0("s3://", raw_sample_paths)
+
+bg_adt_matrix <- list()
+bg_rna_matrix <- list()
+for (id in 1:length(raw_sample_paths)) {
+  
+  cat(raw_sample_paths[id], "\n")
+  raw_adt_mat <- aws.s3::s3read_using(FUN = Read10X_h5, object = raw_sample_paths[id])[["Antibody Capture"]]
+  raw_rna_mat <- aws.s3::s3read_using(FUN = Read10X_h5, object = raw_sample_paths[id])[["Gene Expression"]]
+  tmp_id <- unique(aml_data@meta.data$sample_id[aml_data@meta.data$key %in% sample_paths[id]])
+  colnames(raw_adt_mat) <- paste(colnames(raw_adt_mat), tmp_id, sep = "-")
+  colnames(raw_rna_mat) <- paste(colnames(raw_rna_mat), tmp_id, sep = "-")
+  bg_adt_matrix[[tmp_id]] <- raw_adt_mat[, colSums(raw_adt_mat) > 0]
+  bg_rna_matrix[[tmp_id]] <- Matrix::colSums(raw_rna_mat)[Matrix::colSums(raw_rna_mat) > 0]
+
+}
+
+
+stopifnot(all(sapply(bg_adt_matrix, nrow) == nrow(aml_data@assays$ADT)))
+name_list <- lapply(bg_adt_matrix, rownames)
+name_list <- sapply(name_list, function(arg) all(rownames(arg) == rownames(name_list[[1]])))
+stopifnot(all(name_list))
+
+bg_adt_matrix <- do.call("cbind", bg_adt_matrix)
+
+rownames(bg_adt_matrix) <- toupper(gsub("\\..*", "", rownames(bg_adt_matrix)))
+rownames(bg_adt_matrix) <- toupper(gsub("_", "-", rownames(bg_adt_matrix)))
+rownames(bg_adt_matrix) <- ifelse(rownames(bg_adt_matrix) == "CD371", "CLL1", rownames(bg_adt_matrix))
+stopifnot(all(rownames(bg_adt_matrix) == rownames(aml_data@assays$ADT)))
+
+# select droplets based on RNA and ADT library size
+adt_size <- Matrix::colSums(bg_adt_matrix)
+adt_complex <- Matrix::colSums(bg_adt_matrix > 0)
+rna_size <- unlist(bg_rna_matrix)
+names(rna_size) <- gsub(".*\\.", "", names(rna_size))
+overlap_bc <- intersect(names(adt_size), names(rna_size))
+adt_size <- adt_size[names(adt_size) %in% overlap_bc]
+adt_complex <- adt_complex[names(adt_complex) %in% overlap_bc]
+rna_size <- rna_size[names(rna_size) %in% overlap_bc]
+stopifnot(all(names(adt_size) == names(rna_size)))
+
+qc_df <- data.frame(rna_size = rna_size,
+                    adt_size = adt_size) %>%
+  dplyr::filter(rna_size > 0 & adt_size > 0)
+
+myclust <- mclust::Mclust(data = qc_df, G = 3)
+qc_df <- dplyr::mutate(qc_df, 
+                       cluster = as.factor(myclust$classification),
+                       uncertainty = myclust$uncertainty)
+mysample <- qc_df[sample(1:nrow(qc_df), 5000), ]
+
+ggscatter(data = mysample,
+          title = "Random sample of 5,000 empty droplets",
+          x = "adt_size",
+          y = "rna_size",
+          xlab = "ADT library size",
+          ylab = "mRNA library size",
+          color = "cluster",
+          alpha = 0.1) +
+  scale_x_log10(breaks = c(1, 10, 100, 1000, 10000)) +
+  scale_y_log10() +
+  stat_density2d()
+
+# keep only empty droplets for background matrix
+bg_adt_matrix <- bg_adt_matrix[, !colnames(bg_adt_matrix) %in% colnames(aml_data)]
+# remove droplets with zero signal
+bg_adt_matrix <- bg_adt_matrix[, colSums(bg_adt_matrix) > 50]
+# remove droplets near filter threshold based on histogram of droplet count sums
+bg_adt_matrix <- bg_adt_matrix[, colSums(bg_adt_matrix) < 1000]
+# remove droplets that have large library sizes but low complexity indicating just a few features are saturating the background signal
+#bg_adt_matrix <- bg_adt_matrix[, colSums(bg_adt_matrix > 0) >= 50]
+# remove droplets that have relatively high RNA expression (caution: there are less cells with RNA size info)
+rna_filter <- names(rna_size)[rna_size < 100]
+bg_adt_matrix <- bg_adt_matrix[, colnames(bg_adt_matrix) %in% rna_filter]
+
+
+# plot mean and variance trend for each feature
+fmean <- rowMeans(log1p(bg_adt_matrix))
+fsd <- apply(log1p(bg_adt_matrix), 1, sd)
+full_droplet_means <- rowMeans(log1p(aml_data@assays$ADT@counts))
+full_droplet_means <- full_droplet_means[names(fmean)]
+meanvar_df <- data.frame(feature_mean = fmean,
+                         full_droplet_mean = full_droplet_means,
+                         feature_sd = fsd,
+                         feature_var = fsd^2) %>%
+  tibble::rownames_to_column("gene") %>%
+  dplyr::mutate(label = ifelse(gene %in% c("CD33", "CLL1", "CD123", "EMR2", "CD45", "CD99", "CD44"), gene, NA),
+                coef_of_variation = feature_sd / feature_mean * 100,
+                corrected_value = (full_droplet_mean - feature_mean) / feature_sd) %>%
+  dplyr::arrange(desc(coef_of_variation))
+
+p <- ggscatter(data = meanvar_df,
+               title = "Mean-variance trend in log-space",
+               x = "feature_mean",
+               y = "feature_sd",
+               xlab = "Antigen expression mean",
+               ylab = "Antigen expression SD",
+               add = "loess",
+               add.params = list(color = "red", size = 0.5))  # note: no label or repel argument
+
+# Now add customized labels:
+p + geom_text_repel(aes(label = label),
+                    box.padding = 1,    # extra padding around the label box
+                    point.padding = 0.1,  # extra space around the data point
+                    segment.size = 0.5, # thickness of the connecting line
+                    segment.color = "grey50",
+                    nudge_y = 0.5)    # nudge labels vertically (adjust as needed)
+
+ggbarplot(meanvar_df,
+          x = "gene",
+          y = "coef_of_variation",
+          x.text.angle = 45,
+          fill = "label")
+
+ggscatter(meanvar_df,
+          x = "full_droplet_mean",
+          y = "feature_mean",
+          xlab = "Mean counts in full droplets",
+          ylab = "Mean counts in empty droplets",
+          add = "loess",
+          add.params = list(color = "red", size = 0.5)) + 
+  geom_text_repel(aes(label = label),
+  box.padding = 1,    # extra padding around the label box
+  point.padding = 0.1,  # extra space around the data point
+  segment.size = 0.5, # thickness of the connecting line
+  segment.color = "grey50",
+  nudge_y = 0.5) +
+  scale_x_log10() +
+  scale_y_log10()
+
+# DSB normalization using aggregated background droplet matrix
+cell_adt_matrix <- aml_data@assays$ADT@counts
+# normalize and de-noise with dsb
+stopifnot(isotype_controls %in% rownames(cell_adt_matrix))
+stopifnot(isotype_controls %in% rownames(bg_adt_matrix))
+set.seed(35600)
+cell_sample <- sample(1:ncol(cell_adt_matrix), 2000)
+dsb_norm_mat <- dsb::DSBNormalizeProtein(
+  
+  cell_protein_matrix = cell_adt_matrix, 
+  empty_drop_matrix = bg_adt_matrix, 
+  denoise.counts = TRUE, 
+  use.isotype.control = TRUE, 
+  scale.factor = "standardize",
+  isotype.control.name.vec = isotype_controls
+  
+)
+
+aml_data[["ADT_dsb_qc_filter"]] <- CreateAssayObject(data = dsb_norm_mat$dsb_normalized_matrix)
+
+aml_data_ebayes_list <- NULL
+set.seed(7350)
+for (samp in unique(aml_data$sample_id)) {
+  
+  barcodes <- colnames(bg_adt_matrix)
+  barcodes <- barcodes[gsub(".*-", "", barcodes) %in% samp]
+  
+  qc_df_sample <- qc_df[grepl(samp, rownames(qc_df)), colnames(qc_df) %in% c("rna_size", "adt_size")]
+  myclust <- mclust::Mclust(data = qc_df_sample, G = 3)
+  
+  qc_df_sample <- qc_df_sample %>%
+    dplyr::mutate(cluster = myclust$classification,
+                  uncertainty = myclust$uncertainty)
+  
+  bg_cluster <- which(myclust$parameters$mean["adt_size", ] == median(myclust$parameters$mean["adt_size", ]))
+  top_empty_droplets <- qc_df_sample[rownames(qc_df_sample) %in% barcodes & qc_df_sample$cluster == bg_cluster, ]
+  top_empty_droplets <- top_empty_droplets %>%
+    dplyr::arrange(uncertainty) %>%
+    dplyr::slice(1:1000)
+  top_empty_droplets <- rownames(top_empty_droplets)
+  
+  bg <- bg_adt_matrix[, colnames(bg_adt_matrix) %in% top_empty_droplets]
+  
+  aml_data_ebayes <- dsb_ebayes(
+    
+    cell_protein_matrix = dplyr::filter(aml_data, sample_id %in% samp)@assays$ADT@counts, 
+    empty_drop_matrix = bg, 
+    denoise.counts = TRUE, 
+    scale.factor = "standardize",
+    isotype.control.name.vec = isotype_controls,
+    use.isotype.control = TRUE,
+    return.stats = TRUE
+    
+  )
+  
+  aml_data_ebayes_list[[samp]] <- aml_data_ebayes
+
+}
+
+aml_data_ebayes_list <- lapply(aml_data_ebayes_list, function(arg) arg$dsb_normalized_matrix)
+aml_data_ebayes <- do.call("cbind", aml_data_ebayes_list)
+
+aml_data[["ADT_dsb_ebayes"]] <- CreateAssayObject(data = aml_data_ebayes)
+
+# remove objects to clear up memory
+rm("qc_df")
+rm("rna_size")
+rm("adt_size")
+rm("bg_rna_matrix")
+rm("raw_bc")
+
+dsb_norm_mat_no_iso <- dsb::DSBNormalizeProtein(
+  
+  cell_protein_matrix = aml_data@assays$ADT@counts, 
+  empty_drop_matrix = bg_adt_matrix, 
+  denoise.counts = FALSE, 
+  pseudocount.use = 1
+  
+)
+
+aml_data[["ADT_dsb_no_iso"]] <- CreateAssayObject(data = dsb_norm_mat_no_iso)
+
+```
+
+
+### Cell state annotation
+```{r cell_state_annotation_for_aml_samples}
+
+aml_data <- JoinLayers(aml_data, assay = "RNA")
+
+Idents(aml_data) <- "seurat_clusters_harmony"
+cell_type_markers <- FindAllMarkers(aml_data, assay = "ADT")
+
+# broad cell type markers
+DotPlot(aml_data, 
+        features = c("CD34", "CD38", "CD3", "CD4", "CD8", "CD19", "CD22", "CD14", "CD15", "CD16", "CD11C", "CD11B", "CD9", "CD56", "CD244"), 
+        group.by = "seurat_clusters_harmony",
+        assay = "ADT_limma") + 
+  rotate_x_labels()
+
+# erythroiod rna markers
+DotPlot(aml_data, features = c("GYPA", "GYPB", "HBB", "CD4", "CD8A", "CD8B", "PDCD1", "HAVCR2", "LAG3", "CXCR3"), 
+        group.by = "seurat_clusters_harmony", 
+        assay = "RNA") + 
+  rotate_x_labels()
+
+# nk cell rna markers
+DotPlot(aml_data, 
+        features = c("CD244", "CTSW", "FASLG", "GZMA", "GZMB", "GZMH", "IL18RAP", "IL2RB", "KIR2DL4", "KLRB1", "KLRC3", "KLRD1", "KLRF1", "KLRK1", "NCR1", "NKG7", "PRF1", "XCL1", "XCL2"), 
+        group.by = "seurat_clusters_harmony", 
+        assay = "RNA") + 
+  rotate_x_labels()
+
+aml_data <- aml_data %>%
+  dplyr::mutate(cell_state_harmony_rna = case_when(seurat_clusters_harmony %in% c(23) ~ "T cell Erythroid doublet",
+                                                   seurat_clusters_harmony %in% c(6) ~ "CD4 T cell",
+                                                   seurat_clusters_harmony %in% c(5, 27) ~ "CD8 T cell",
+                                                   seurat_clusters_harmony %in% c(24) ~ "DP T cell",
+                                                   seurat_clusters_harmony %in% c(22) ~ "NKT cell",
+                                                   seurat_clusters_harmony %in% c(25, 21) ~ "B cell",
+                                                   seurat_clusters_harmony %in% c(19) ~ "Dendritic cell",
+                                                   seurat_clusters_harmony %in% c(3) ~ "Monocyte",
+                                                   seurat_clusters_harmony %in% c(18, 9) ~ "Macrophage",
+                                                   seurat_clusters_harmony %in% c(8, 28, 20, 17, 15, 13, 11) ~ "Erythroid",
+                                                   TRUE ~ "Blast"),
+    
+                cell_state_harmony_rna = ifelse(sample_id %in% c("Patient_31_Diagnosis", "Patient_41_Relapse", "Patient_44_Relapse") & seurat_clusters_harmony %in% "Monocyte", 
+                                                "Blast", 
+                                                as.character(cell_state_harmony_rna)), # AMoL samples identified by flow
+                
+                cell_state_harmony_rna = factor(cell_state_harmony_rna, levels = c("Blast", 
+                                                                                   "Monocyte",
+                                                                                   "Macrophage",
+                                                                                   "Dendritic cell", 
+                                                                                   "CD4 T cell", 
+                                                                                   "CD8 T cell", 
+                                                                                   "DP T cell", 
+                                                                                   "NKT cell",
+                                                                                   "B cell", 
+                                                                                   "Erythroid", 
+                                                                                   "T cell Erythroid doublet")))
+
+# monocyte_data <- filter(aml_data, cell_state_harmony_rna == "Monocyte")
+# 
+# monocyte_data <- FindNeighbors(monocyte_data, 
+#                                reduction = "harmony", 
+#                                graph.name = c("nn_harmony", "snn_harmony"), 
+#                                dims = 1:10)
+# 
+# monocyte_data <- FindClusters(monocyte_data, 
+#                               graph.name = "snn_harmony", 
+#                               cluster.name = "seurat_clusters_harmony_monocyte", 
+#                               resolution = 0.3, 
+#                               method = "igraph", 
+#                               random.seed = 8791)
+# 
+# monocyte_data <- RunUMAP(monocyte_data, 
+#                     reduction = "harmony", 
+#                     dims = 1:20, 
+#                     reduction.key = "UMAP_harmony_monocyte", 
+#                     reduction.name = "umap_harmony_monocyte", 
+#                     repulsion.strength = 5, 
+#                     seed.use = 1341)
+# 
+# 
+# DimPlot(monocyte_data, group.by = "seurat_clusters_harmony_monocyte", reduction = "umap_harmony_monocyte")
+# DotPlot(monocyte_data, assay = "ADT", features = c("CD34", "CD38", "CD45", "CD14", "CD15", "CD16", "CD64"), group.by = "seurat_clusters_harmony_monocyte")
+
+# plot umap
+DimPlot(aml_data, 
+        reduction = "umap_harmony", 
+        group.by = "cell_state_harmony_rna", 
+        label = TRUE, 
+        repel = TRUE,
+        label.size = 7,
+        alpha = 0.2,
+        shuffle = TRUE) + 
+  NoLegend() + 
+  NoAxes() +
+  ggsci::scale_color_ucscgb()
+
+# remove doublets and plot umap
+aml_data_filt <- dplyr::filter(aml_data, !(cell_state_harmony_rna %in% c("DP T cell", "T cell Erythroid doublet")))
+aml_data_filt <- dplyr::mutate(aml_data_filt, cell_state_harmony_rna = as.factor(cell_state_harmony_rna))
+
+DimPlot(aml_data_filt, 
+        reduction = "umap_harmony", 
+        group.by = "cell_state_harmony_rna", 
+        label = TRUE, 
+        repel = TRUE,
+        label.size = 5,
+        alpha = 0.7) + 
+  NoLegend() + 
+  NoAxes() +
+  ggsci::scale_color_ucscgb()
+
+FeaturePlot(aml_data_filt,
+            reduction = "umap_harmony",
+            features = c("CD33", "CLL1", "CD34", "CD45"),
+            order = TRUE,
+            cols = c("lightblue", "violetred")) &
+NoAxes()
+
+set.seed(264599)
+cell_states <- as.character(unique(aml_data_filt$cell_state_harmony_rna))
+cell_states <- cell_states[!grepl("doublet", cell_states, ignore.case = TRUE)]
+random_cells <- lapply(cell_states, function(arg) {
+  sample(aml_data_filt$barcode[aml_data_filt$cell_state_harmony_rna %in% arg], 100, replace = FALSE)
+}) %>% unlist()
+
+DoHeatmap(aml_data_filt %>% 
+            dplyr::mutate(cell_state_harmony_rna = factor(as.character(cell_state_harmony_rna), 
+                                                          levels = c("Blast", "Monocyte", "Dendritic cell", "CD4 T cell", "CD8 T cell", "B cell", "Erythroid"))), 
+          assay = "ADT", 
+          cells = random_cells , 
+          group.by = "cell_state_harmony_rna", 
+          features = c("CD34", "CD117", "CD90", "CD133", "CD14", "CD15", "CD16", "CD33", "CLL1", "CD123", "CD11B", "CD11C", "CD3", "CD4", "CD8", "CD19", "CD235A", "CD71", "CD45"),
+          size = 4,
+          group.colors = pal_ucscgb("default")(26),
+          raster = FALSE)
+  
+
+aml_data[["ADT"]] <- as(object = aml_data[["ADT"]], Class = "Assay5")
+
+# SeuratObject::SaveSeuratRds(
+#   object = aml_data, 
+#   file = "aml/aml_atlas_filtered_integrated_seurat_paired_disease_only_20240110.rds"
+# )
+
+```
+
+```{r}
+
+sampled_data <- subset(aml_data, cells = sample(colnames(aml_data), 50000, replace = FALSE))
+gif_data <- sampled_data@reductions$umap_harmony_3d@cell.embeddings %>% as.data.frame()
+gif_data <- dplyr::mutate(gif_data, cell_state = sampled_data$cell_state_harmony_rna)
+
+N <- 100
+x <- rnorm(N, mean = 50, sd = 2.3)
+y <- runif(N, min = 0, max = 100)
+z <- runif(N, min = 4, max = 70)
+luci.frame <- data.frame(x, y, z)
+
+Noax <- list(
+  title = "",
+  zeroline = FALSE,
+  showline = FALSE,
+  showticklabels = FALSE,
+  showgrid = FALSE
+)
+
+fig <- plotly::plot_ly(
+  type = "scatter3d",
+  mode = "markers",
+  data = as.data.frame(gif_data),
+  color = ~cell_state,
+  colors = c("red", "orange", "yellow", "green", "blue", "aquamarine", "forestgreen","gray", "pink"),
+  size = 0.1,
+  x = ~ UMAPharmony3d_1,
+  y = ~ UMAPharmony3d_2,
+  z = ~ UMAPharmony3d_3
+) %>%
+  plotly::layout(scene = list(xaxis = list(visible = FALSE), 
+                              yaxis = list(visible = FALSE),
+                              zaxis = list(visible = FALSE),
+                              camera = list(
+                                eye = list(
+                                  x = 1.5,
+                                  y = 1.5,
+                                  z = 0.5
+                                  ),
+                                center = list(x = 0,
+                                              y = 0,
+                                              z = 0)
+                                ))) %>%
+  onRender("
+      function(el, x){
+  var id = el.getAttribute('id');
+  var gd = document.getElementById(id);
+  Plotly.update(id).then(attach);
+  function attach() {
+    var cnt = 0;
+    
+    function run() {
+      rotate('scene', Math.PI / 200);
+      requestAnimationFrame(run);
+    } 
+    run();
+    
+    function rotate(id, angle) {
+      var eye0 = gd.layout[id].camera.eye
+      var rtz = xyz2rtz(eye0);
+      rtz.t += angle;
+      
+      var eye1 = rtz2xyz(rtz);
+      Plotly.relayout(gd, id + '.camera.eye', eye1)
+    }
+    
+    function xyz2rtz(xyz) {
+      return {
+        r: Math.sqrt(xyz.x * xyz.x + xyz.y * xyz.y),
+        t: Math.atan2(xyz.y, xyz.x),
+        z: xyz.z
+      };
+    }
+    
+    function rtz2xyz(rtz) {
+      return {
+        x: rtz.r * Math.cos(rtz.t),
+        y: rtz.r * Math.sin(rtz.t),
+        z: rtz.z
+      };
+    }
+  };
+}
+    ")
+
+
+htmlwidgets::saveWidget(plotly::partial_bundle(fig), file = "rotate_scatter3d.HTML", selfcontained = TRUE)
+
+utils::browseURL("rotate_scatter3d.HTML")
+
+```
+
+
+# Everything
+```{r integrate_data_all, eval = FALSE}
+
+# Normalize, scale, and find variable features 
+mydata <- NormalizeData(orig_data, normalization.method = "LogNormalize", assay = "RNA", margin = 2)
+mydata <- FindVariableFeatures(mydata, assay = "RNA")
+mydata <- ScaleData(mydata, assay = "RNA") 
+mydata <- RunPCA(mydata, assay = "RNA", seed.use = 466) 
+mydata <- RunUMAP(mydata, dims = 1:25, assay = "RNA", seed.use = 59111)
+
+set.seed(9912)
+mydata <- IntegrateLayers(
+  object = mydata, 
+  assay = "RNA",
+  group.by = "patient",
+  method = HarmonyIntegration, #other methods don't work with Seurat v5 beta
+  orig.reduction = "pca", 
+  verbose = TRUE
+)
+
+mydata <- FindNeighbors(mydata, 
+                        reduction = "harmony", 
+                        graph.name = c("nn_harmony", "snn_harmony"), 
+                        dims = 1:50)
+
+mydata <- FindClusters(mydata, 
+                       graph.name = "snn_harmony", 
+                       cluster.name = "seurat_clusters_harmony", 
+                       resolution = 2, 
+                       method = "igraph", 
+                       random.seed = 8791)
+
+mydata <- RunUMAP(mydata, 
+                  reduction = "harmony", 
+                  dims = 1:20, 
+                  reduction.key = "UMAP_harmony_", 
+                  reduction.name = "umap_harmony", 
+                  repulsion.strength = 2, 
+                  seed.use = 11941)
+
+mydata <- JoinLayers(mydata, assay = "ADT")
+
+DefaultAssay(mydata) <- "ADT"
+
+# convert ADT counts to sparse matrix 
+mydata[["ADT"]] <- as(object = mydata[["ADT"]], Class = "Assay")
+
+# ignore variation from isotype controls
+adt_feats <- rownames(mydata@assays$ADT)
+adt_feats <- adt_feats[!grepl("isotype", adt_feats, ignore.case = TRUE)]
+
+mydata <- mydata %>%
+  NormalizeData(normalization.method = "CLR", assay = "ADT", margin = 2) %>%
+  ScaleData(assay = "ADT", features = adt_feats) %>%
+  RunPCA(assay = "ADT", reduction.name = "pca_adt", features = adt_feats, seed.use = 6587) %>%
+  FindNeighbors(reduction = "pca_adt", graph.name = "snn_adt") %>%
+  FindClusters(graph.name = "snn_adt", cluster.name = "seurat_clusters_adt", random.seed = 1193) %>%
+  RunUMAP(reduction = "pca_adt", reduction.name = "umap_adt", seed.use = 698, dims = 1:10)
+
+DimPlot(mydata, reduction = "umap_harmony")
+
+```
+
+#### Reference mapping
+##### Transfer labels from healthy reference to aml atlas
+```{r reference_mapping, eval = TRUE}
+
+DefaultAssay(healthy_data) <- "RNA"
+DefaultAssay(aml_data) <- "RNA"
+
+#healthy_data <- JoinLayers(healthy_data, assay = "RNA")
+
+# create reference from healthy data for projection
+# options(Seurat.object.assay.version = 'v3')
+# reference <- CreateSeuratObject(counts = as(LayerData(healthy_data, assay = "RNA", layers = "counts"), "dgCMatrix"), 
+#                                 meta.data = healthy_data@meta.data)
+# reference@assays$RNA@data <- healthy_data@assays$mnn.reconstructed@data
+# reference <- FindVariableFeatures(reference)
+
+# add reductions
+# reference@reductions$integrated.mnn <- healthy_data@reductions$integrated.mnn
+# reference@reductions$umap_mnn <- healthy_data@reductions$umap_mnn
+# reference@reductions$pca <- healthy_data@reductions$pca
+# DefaultAssay(reference) <- "RNA"
+# mysplit <- SplitObject(reference, split.by = "sample_id")
+# mysplit <- lapply(mysplit, function(arg) {
+#   arg <- FindVariableFeatures(arg, nfeatures = 500)
+#   arg <- NormalizeData(arg)
+#   return(arg)
+# })
+# anchors <- FindIntegrationAnchors(mysplit[c(1, 3)]) 
+# healthy_data <- IntegrateData(anchorset = anchors)
+
+
+query_list <- SplitObject(aml_data, split.by = "sample_id")
+cell_state_list <- NULL
+for (query in names(query_list)) {
+  
+  cat("\r", query)
+  query_sample <- query_list[[query]]
+  query_sample <- CreateSeuratObject(counts = as(LayerData(query_sample, layer = "counts"), "dgCMatrix"), meta.data = query_sample@meta.data)
+  query_sample <- query_sample %>%
+    FindVariableFeatures() %>%
+    NormalizeData() %>%
+    ScaleData() %>% 
+    RunPCA()
+  
+  anchors <- FindTransferAnchors(
+    reference = healthy_data,
+    query = query_sample,
+    reference.assay = "RNA",
+    query.assay = "RNA",
+    normalization.method = "LogNormalize",
+    reference.reduction = "pca",
+    dims = 1:50,
+    project.query = FALSE
+  )
+
+  cell_state_list[[query]] <- TransferData(anchorset = anchors, refdata = healthy_data$cell_state_mnn_rna_l1, dims = 1:50)
+  
+}
+
+cell_state_prediction <- do.call("rbind", cell_state_list) %>%
+  janitor::clean_names()
+#cell_state_prediction <- cell_state_prediction[match(colnames(aml_data), rownames(cell_state_prediction)), ]
+stopifnot(all(gsub(".*\\.", "", rownames(cell_state_prediction)) == colnames(aml_data)))
+aml_data <- AddMetaData(aml_data, metadata = cell_state_prediction)
+
+table(aml_data$cell_state_harmony_rna, aml_data$predicted_id)
+table(dplyr::filter(aml_data, prediction_score_max > 0.8) %>% dplyr::pull(cell_state_harmony_rna),
+      dplyr::filter(aml_data, prediction_score_max > 0.8) %>% dplyr::pull(predicted_id))
+mytable <- table(aml_data$cell_state_harmony_rna, aml_data$predicted_id)
+pheatmap(mytable, display_numbers = TRUE, number_color = "darkblue", fontsize_number = 9)
+
+
+```
+
+##### Transfer labels from Triana reference to aml atlas
+```{r reference_mapping_triana, eval = TRUE}
+
+triana <- aws.s3::s3readRDS(object = "s3://vorbio-datascience/genomics/external_data/single_cell_rnaseq/triana/WTA_projected.rds")
+cells_to_remove <- table(triana$ct)
+cells_to_remove <- names(cells_to_remove)[cells_to_remove < 10]
+triana <- dplyr::filter(triana, !ct %in% cells_to_remove) %>%
+  dplyr::mutate(ct = factor(ct))
+
+query_list <- SplitObject(aml_data, split.by = "sample_id")
+cell_state_list <- NULL
+for (query in names(query_list)) {
+  
+  cat("\r", query)
+  query_sample <- query_list[[query]]
+  query_sample <- CreateSeuratObject(counts = as(LayerData(query_sample, layer = "counts"), "dgCMatrix"), meta.data = query_sample@meta.data)
+  query_sample <- query_sample %>%
+    FindVariableFeatures() %>%
+    NormalizeData() %>%
+    ScaleData() %>% 
+    RunPCA()
+  
+  anchors <- FindTransferAnchors(
+    reference = triana,
+    query = query_sample,
+    reference.assay = "RNA",
+    query.assay = "RNA",
+    normalization.method = "LogNormalize",
+    dims = 1:50,
+    project.query = FALSE
+  )
+
+  cell_state_list[[query]] <- TransferData(anchorset = anchors, refdata = triana$ct, dims = 1:50)
+  
+}
+
+cell_state_prediction <- do.call("rbind", cell_state_list) %>%
+  janitor::clean_names()
+colnames(cell_state_prediction) <- paste("triana", colnames(cell_state_prediction), sep = "_")
+
+aml_data <- AddMetaData(aml_data, metadata = cell_state_prediction)
+
+table(aml_data$cell_state_harmony_rna, aml_data$triana_predicted_id)
+table(dplyr::filter(aml_data, triana_prediction_score_max > 0.8) %>% dplyr::pull(cell_state_harmony_rna),
+      dplyr::filter(aml_data, triana_prediction_score_max > 0.8) %>% dplyr::pull(triana_predicted_id))
+mytable <- table(aml_data$cell_state_harmony_rna, aml_data$triana_predicted_id)
+pheatmap(mytable, display_numbers = TRUE, number_color = "darkblue", fontsize_number = 9)
+
+
+```
+
+
+##### Project aml atlas onto healthy reference UMAP
+```{r project_data_to_reference}
+
+DefaultAssay(healthy_data) <- "RNA"
+DefaultAssay(aml_data) <- "RNA"
+
+healthy_data <- JoinLayers(healthy_data, assay = "RNA")
+
+# create reference from healthy data for projection
+options(Seurat.object.assay.version = 'v3')
+reference <- CreateSeuratObject(counts = as(LayerData(healthy_data, assay = "RNA", layers = "counts"), "dgCMatrix"), 
+                                meta.data = healthy_data@meta.data)
+reference@assays$RNA@data <- healthy_data@assays$mnn.reconstructed@data
+
+# add reductions
+reference@reductions$integrated.mnn <- healthy_data@reductions$integrated.mnn
+reference@reductions$umap_mnn <- healthy_data@reductions$umap_mnn
+reference@reductions$pca <- healthy_data@reductions$pca
+DefaultAssay(reference) <- "RNA"
+
+# project aml atlas to healthy reference
+anchors <- FindTransferAnchors(
+  reference = reference,
+  query = aml_data,
+  reference.assay = "RNA",
+  query.assay = "RNA",
+  normalization.method = "LogNormalize",
+  reference.reduction = "integrated.mnn",
+  dims = 1:50,
+  project.query = FALSE,
+  features = rownames(reference@reductions$integrated.mnn@feature.loadings)
+)
+
+reference[["RNA"]] <- as(object = reference[["RNA"]], Class = "Assay5")
+
+cell_state_prediction <- TransferData(anchorset = anchors, refdata = reference$cell_state_mnn_rna_l1, dims = 1:50)
+
+feature.loadings <- reference@reductions$integrated.mnn@feature.loadings
+feature.loadings <- feature.loadings[rownames(feature.loadings) %in% rownames(aml_data@assays$RNA), ]
+pca.features <- rownames(feature.loadings)
+
+aml_data <- ScaleData(aml_data, features = pca.features, assay = "RNA")
+pca.embeddings <- t(LayerData(aml_data, assay = "RNA", layer = "scale.data")[pca.features, ]) %*% feature.loadings
+aml_data[["integrated_mnn_embed"]] <- CreateDimReducObject(embeddings = pca.embeddings, key = "MNN_EMBED_", assay = "RNA")
+
+aml_data <- ProjectUMAP(
+  query = aml_data,
+  k.param = 30,
+  n.ntrees = 100,
+  l2.norm = FALSE,
+  query.reduction = "integrated_mnn_embed",
+  reference = reference,
+  reference.reduction = "integrated.mnn",
+  reduction.model = "umap_mnn",
+)
+
+aml_data <- AddMetaData(aml_data, metadata = janitor::clean_names(cell_state_prediction))
+
+
+aml_data <- dplyr::mutate(aml_data, predicted_id = factor(predicted_id, levels = c("HSC",
+                                                                                    "MEP",
+                                                                                    "GMP",
+                                                                                    "Monocyte",
+                                                                                    "DC",
+                                                                                    "NK",
+                                                                                    "B cell",
+                                                                                    "preB",
+                                                                                    "CD4+ naive T",
+                                                                                    "CD4+ memory T",
+                                                                                    "CD8+ naive T",
+                                                                                    "CD8+ memory T",
+                                                                                    "Erythroblast",
+                                                                                    "Erythroid",
+                                                                                    "Unknown")))
+                                                          
+                                                          
+DimPlot(aml_data, group.by = "cell_state_harmony_rna", reduction = "ref.umap", label = TRUE, repel = TRUE) + NoAxes() + NoLegend()
+
+DimPlot(aml_data, reduction = "umap_harmony", group.by = "predicted_id", label = TRUE, repel = TRUE, cols = as.character(mycols)) + 
+  scale_x_reverse() +
+  NoAxes() +
+  NoLegend()
+
+DimPlot(aml_data, reduction = "ref.umap", group.by = "predicted_id", label = TRUE, repel = TRUE, cols = as.character(mycols)) + 
+  scale_x_reverse() +
+  NoAxes()
+
+
+```
+
+#### Cell state annotation
+```{r fig.height = 9, fig.width = 12, eval = FALSE}
+
+adt_markers <- list(tcell = c("CD2", "CD3", "CD4", "CD8"),
+                    bcell = c("CD19", "CD22"),
+                    myeloid = c("CD11B", "CD14", "CD15", "CD16", "CD33"),
+                    eryth = c("CD71","CD235A"),
+                    blast = c("CD45"))
+
+DotPlot(mydata, assay = "ADT", features = as.character(unlist(adt_markers)), group.by = "seurat_clusters_harmony") +
+  coord_flip() +
+  RotatedAxis() 
+
+DotPlot(mydata, assay = "RNA", features = c("GYPA", "TFRC", "HBD", "SLC25A37"), group.by = "seurat_clusters_harmony") +
+  coord_flip() +
+  RotatedAxis() 
+
+b_cells <- c(27, 34, 40, 72, 75, 83)
+t_cells <- c(7, 8, 21, 37, 43, 57, 62, 66)
+erythrocytes <- c(14, 17, 19, 22, 23, 28, 30, 31, 32, 42, 50, 53, 54, 60, 67, 68, 69, 47, 76, 79, 84, 80, 81)
+monocytes <- c(2, 18, 12, 44, 48, 41, 78, 82)
+multiplets <- c(36)
+
+mydata <- mydata %>%
+  dplyr::mutate(cell_state_l1 = case_when(seurat_clusters_harmony %in% b_cells ~ "B cell",
+                                          seurat_clusters_harmony %in% t_cells ~ "T cell",
+                                          seurat_clusters_harmony %in% erythrocytes ~ "Erythrocyte",
+                                          seurat_clusters_harmony %in% monocytes ~ "Monocyte",
+                                          seurat_clusters_harmony %in% multiplets ~ "Multiplet",
+                                          TRUE ~ "Blast"),
+                cell_state_l1 = as.character(cell_state_l1))
+
+DimPlot(mydata, 
+        group.by = "cell_state_l1", 
+        reduction = "umap_harmony", 
+        label = TRUE, 
+        order = list("Tcell", "Blast", "B cell", "Monocyte", "Erythrocyte", "Multiplet")) + NoAxes()
+
+```
+
+## Check blast percentage concordance
+```{r check_blast_percentage}
+
+blast_counts <- table(aml_data$cell_state_harmony_rna, aml_data$sample_id)
+
+col_sums <- colSums(blast_counts)
+blast_counts <- sweep(x = blast_counts, MARGIN = 2, STATS = col_sums, FUN = "/")
+blast_percent <- blast_counts["Blast", , drop = FALSE] %>% 
+  t() %>%
+  as.data.frame.matrix() %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::mutate(Blast = Blast * 100)
+                      
+blast_metadata <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                       object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/aml_atlas_sample_metadata.csv") %>%
+  dplyr::select(sample_id, blast_percent_vor) %>%
+  dplyr::filter(!grepl("Healthy", sample_id)) %>%
+  dplyr::filter(!is.na(blast_percent_vor))
+
+blast_data <- dplyr::inner_join(blast_percent, blast_metadata, by = "sample_id")
+model_res <- lm(blast_percent_vor ~ Blast, data = blast_data)$residuals
+blast_data <- dplyr::mutate(blast_data, residuals = model_res, abs_dev = abs(Blast - blast_percent_vor)) %>%
+  dplyr::mutate(`Model` = ifelse(abs(residuals) < 25, "yes", "no"))
+
+deviant_samples <- blast_data$sample_id[blast_data$Model == "no"]
+
+ggpubr::ggscatter(blast_data,
+                  x = "Blast",
+                  y = "blast_percent_vor",
+                  xlab = "CITEseq blast %",
+                  ylab = "Flow blast %",
+                  xlim = c(1, 100),
+                  ylim = c(1, 100),
+                  #label = "sample_id",
+                  cor.coef = TRUE,
+                  #label.select = blast_data$sample_id[blast_data$Model == "no"],
+                  repel = TRUE,
+                  font.label = c(8, "plain"),
+                  size = 2) +
+  geom_smooth(lty = 2, method = "lm",  lwd = 0.4)
+
+ggpubr::ggscatter(blast_data,
+                  x = "Blast",
+                  y = "blast_percent_vor",
+                  color = "Model",
+                  xlab = "CITEseq blast %",
+                  ylab = "Flow blast %",
+                  xlim = c(1, 100),
+                  ylim = c(1, 100),
+                  cor.coef = TRUE,
+                  cor.coef.coord = c(0, 100),
+                  palette = c("lightgray", "orchid1"),
+                  size = 2) +
+  geom_abline(slope = 1, lty = 2)
+
+
+```
+
+# Generate table 1
+```{r generate_table1}
+
+patient_age <- aws.s3::s3read_using(FUN = readr::read_csv,
+                                    object = "s3://vorbio-datascience/genomics/internal_data/single_cell_meta_analysis/aml_hematology_atlas/patient_age_at_dx.csv")
+
+tdata <- aml_data@meta.data %>%
+  dplyr::select(patient, uhn_patient_id, time, vital_status, date_of_dx, relapse_date_1, initial_tx, response_to_initial_tx, date_of_death_or_last_follow_up, blast_percent_vor, hsct, cytogenetics_1) %>%
+  dplyr::distinct() %>%
+  dplyr::left_join(patient_age, by = "uhn_patient_id") %>%
+  dplyr::select(-patient_manuscript_id, -uhn_patient_id) %>%
+  tidyr::pivot_wider(names_from = time, values_from = blast_percent_vor) %>%
+  dplyr::mutate(sex = dplyr::case_when(grepl("XX", cytogenetics_1) & !grepl("XY", cytogenetics_1) ~ "Female",
+                                       grepl("XY", cytogenetics_1) & !grepl("XX", cytogenetics_1) ~ "Male",
+                                       patient == "Patient_49" ~ "Male"),
+                date_of_dx = as_date(date_of_dx),
+                relapse_date_1 = as_date(relapse_date_1),
+                date_of_death_or_last_follow_up = as_date(date_of_death_or_last_follow_up),
+                days_to_relapse = relapse_date_1 - date_of_dx,
+                days_to_last_follow_up = date_of_death_or_last_follow_up - date_of_dx,
+                #initial_tx = ifelse(initial_tx == "3+7", "7+3", initial_tx),
+                initial_tx = gsub("Clinical Trial with ", "", initial_tx),
+                initial_tx = ifelse(initial_tx == "SGI", "SGI-110", initial_tx),
+                hsct = ifelse(hsct == "HSCT", "Yes", "No"),
+                vital_status = ifelse(vital_status == "Dead", "Deceased", "Alive")) %>%
+  dplyr::select(-patient, -date_of_dx, -relapse_date_1, -date_of_death_or_last_follow_up, -cytogenetics_1) %>%
+  dplyr::select(sex, age_at_aml_dx, Diagnosis, Relapse, initial_tx, response_to_initial_tx, hsct, vital_status, days_to_relapse, days_to_last_follow_up) %>%
+  dplyr::mutate(response_to_initial_tx = gsub(" \\(CR\\)", "", response_to_initial_tx),
+                response_to_initial_tx = gsub("response", "remission", response_to_initial_tx),
+                response_to_initial_tx = dplyr::case_when(response_to_initial_tx %in% "Complete remission" ~ "Complete remission (CR)",
+                                                          response_to_initial_tx %in% "No remission" ~ "Primary refractory disease (PRD)",
+                                                          response_to_initial_tx %in% "Partial remission" ~ "Partial remission (PR)"))
+
+colnames(tdata) <- c("Sex", "Age at diagnosis", "Blast % at diagnosis", "Blast % at relapse", "Initial treatment", "Response to inital treatment", "Prior HCT", "Vital status", "Days to first relapse", "Days to last follow up")
+tdata |> tbl_summary() |> modify_caption("**Table 1. Patient Characteristics**") |> bold_labels()
+
+
+tdata <- dplyr::select(tdata, Sex, `Age at diagnosis`, `Blast % at diagnosis`, `Blast % at relapse`, `Initial treatment`, `Response to inital treatment`, `Prior HCT`)
+tdata |> tbl_summary() |> modify_caption("**Table 1. Patient Characteristics**") |> bold_labels()
+
+```
+
+```{r save_objects}
+
+output_path <- "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat_2024-04-03/aml_data_v2.rds"
+
+if (!file.exists(output_path)) saveRDS(aml_data, file = output_path)
+
+output_path <- "/home/rstudio/data/project_workspace/internal/sc_rnaseq/meta_analysis/aml_atlas/seurat_2024-04-03/reference_v2.rds"
+
+if (!file.exists(output_path)) saveRDS(aml_data, file = output_path)
+
+```
